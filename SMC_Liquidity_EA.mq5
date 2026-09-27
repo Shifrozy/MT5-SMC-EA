@@ -311,7 +311,7 @@ input int             News2Minute              = 0;             // News Event 2 
 input int             NewsBlackoutMins         = 30;            // Blackout Window (mins each side)
 
 input group "══════ Protection ══════"
-input int             MaxSpreadPoints          = 50;            // Max Allowed Spread (points)
+input int             MaxSpreadPoints          = 0;             // Max Allowed Spread (points, 0=off)
 input int             Slippage                 = 10;            // Max Slippage (points)
 input double          MinFreeMarginPct         = 50.0;          // Min Free Margin %
 
@@ -759,86 +759,102 @@ bool DetectCHoCH(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double po
 
    if(st.bias == DIR_BEARISH)
    {
-      // Find most recent confirmed LTF swing low
       if(st.ltfSwingLowCount == 0) return false;
-      double swingLow  = st.ltfSwingLows[0].price;
-      int    swingBar  = st.ltfSwingLows[0].barIndex;
 
-      // Scan for a break below this swing low (bars more recent than the swing)
-      for(int b = 1; b < swingBar && b < ltfCount; b++)
+      // Iterate ALL detected swing lows — the most recent swing's confirmation
+      // window overlaps with our scan window, making it impossible to detect a break.
+      // Older swings have post-confirmation bars available for break detection.
+      for(int swIdx = 0; swIdx < st.ltfSwingLowCount; swIdx++)
       {
-         bool broken = false;
-         switch(StructureBreakMethod)
-         {
-            case BREAK_WICK:
-               broken = (ltfRates[b].low < swingLow - minBreak);
-               break;
-            case BREAK_CANDLE_CLOSE:
-               broken = (ltfRates[b].close < swingLow - minBreak);
-               break;
-            case BREAK_BODY_CLOSE:
-               broken = (MathMin(ltfRates[b].open, ltfRates[b].close) < swingLow - minBreak);
-               break;
-         }
+         double swingLow  = st.ltfSwingLows[swIdx].price;
+         int    swingBar  = st.ltfSwingLows[swIdx].barIndex;
 
-         if(broken)
-         {
-            // Verify displacement size
-            bool isBearishCandle = (ltfRates[b].close < ltfRates[b].open);
-            double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
+         // Limit scan to bars OUTSIDE the swing's confirmation window.
+         // With swingStr=S, the confirmation uses bars swingBar-1 down to swingBar-S.
+         // So the safe scan range ends at swingBar - LTFSwingStrength.
+         int scanLimit = swingBar - LTFSwingStrength;
+         if(scanLimit <= 1) continue; // No post-confirmation bars available — skip
 
-            if(isBearishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+         for(int b = 1; b < scanLimit && b < ltfCount; b++)
+         {
+            bool broken = false;
+            switch(StructureBreakMethod)
             {
-               st.chochLevel       = swingLow;
-               st.chochBar         = b;
-               st.chochTime        = ltfRates[b].time;
-               st.displacementBar  = b;
+               case BREAK_WICK:
+                  broken = (ltfRates[b].low < swingLow - minBreak);
+                  break;
+               case BREAK_CANDLE_CLOSE:
+                  broken = (ltfRates[b].close < swingLow - minBreak);
+                  break;
+               case BREAK_BODY_CLOSE:
+                  broken = (MathMin(ltfRates[b].open, ltfRates[b].close) < swingLow - minBreak);
+                  break;
+            }
 
-               LogInfo(StringFormat("%s Bearish CHoCH confirmed at %.5f (bar %d, body=%.5f, ATR=%.5f)",
-                                    st.symbol, swingLow, b, bodySize, st.currentATR_LTF));
-               return true;
+            if(broken)
+            {
+               bool isBearishCandle = (ltfRates[b].close < ltfRates[b].open);
+               double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
+
+               if(isBearishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+               {
+                  st.chochLevel       = swingLow;
+                  st.chochBar         = b;
+                  st.chochTime        = ltfRates[b].time;
+                  st.displacementBar  = b;
+
+                  LogInfo(StringFormat("%s Bearish CHoCH at %.5f (bar %d, swing bar %d, body=%.5f, ATR=%.5f)",
+                                       st.symbol, swingLow, b, swingBar, bodySize, st.currentATR_LTF));
+                  return true;
+               }
             }
          }
       }
    }
    else if(st.bias == DIR_BULLISH)
    {
-      // Find most recent confirmed LTF swing high
       if(st.ltfSwingHighCount == 0) return false;
-      double swingHigh = st.ltfSwingHighs[0].price;
-      int    swingBar  = st.ltfSwingHighs[0].barIndex;
 
-      for(int b = 1; b < swingBar && b < ltfCount; b++)
+      for(int swIdx = 0; swIdx < st.ltfSwingHighCount; swIdx++)
       {
-         bool broken = false;
-         switch(StructureBreakMethod)
-         {
-            case BREAK_WICK:
-               broken = (ltfRates[b].high > swingHigh + minBreak);
-               break;
-            case BREAK_CANDLE_CLOSE:
-               broken = (ltfRates[b].close > swingHigh + minBreak);
-               break;
-            case BREAK_BODY_CLOSE:
-               broken = (MathMax(ltfRates[b].open, ltfRates[b].close) > swingHigh + minBreak);
-               break;
-         }
+         double swingHigh = st.ltfSwingHighs[swIdx].price;
+         int    swingBar  = st.ltfSwingHighs[swIdx].barIndex;
 
-         if(broken)
-         {
-            bool isBullishCandle = (ltfRates[b].close > ltfRates[b].open);
-            double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
+         int scanLimit = swingBar - LTFSwingStrength;
+         if(scanLimit <= 1) continue;
 
-            if(isBullishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+         for(int b = 1; b < scanLimit && b < ltfCount; b++)
+         {
+            bool broken = false;
+            switch(StructureBreakMethod)
             {
-               st.chochLevel       = swingHigh;
-               st.chochBar         = b;
-               st.chochTime        = ltfRates[b].time;
-               st.displacementBar  = b;
+               case BREAK_WICK:
+                  broken = (ltfRates[b].high > swingHigh + minBreak);
+                  break;
+               case BREAK_CANDLE_CLOSE:
+                  broken = (ltfRates[b].close > swingHigh + minBreak);
+                  break;
+               case BREAK_BODY_CLOSE:
+                  broken = (MathMax(ltfRates[b].open, ltfRates[b].close) > swingHigh + minBreak);
+                  break;
+            }
 
-               LogInfo(StringFormat("%s Bullish CHoCH confirmed at %.5f (bar %d, body=%.5f, ATR=%.5f)",
-                                    st.symbol, swingHigh, b, bodySize, st.currentATR_LTF));
-               return true;
+            if(broken)
+            {
+               bool isBullishCandle = (ltfRates[b].close > ltfRates[b].open);
+               double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
+
+               if(isBullishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+               {
+                  st.chochLevel       = swingHigh;
+                  st.chochBar         = b;
+                  st.chochTime        = ltfRates[b].time;
+                  st.displacementBar  = b;
+
+                  LogInfo(StringFormat("%s Bullish CHoCH at %.5f (bar %d, swing bar %d, body=%.5f, ATR=%.5f)",
+                                       st.symbol, swingHigh, b, swingBar, bodySize, st.currentATR_LTF));
+                  return true;
+               }
             }
          }
       }
@@ -873,7 +889,11 @@ bool DetectBOS(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double poin
          // This swing low must be different from the CHoCH level
          if(MathAbs(swingLow - st.chochLevel) < minBOS) continue;
 
-         for(int b = 1; b < swingBar; b++)
+         // Scan only bars OUTSIDE the swing's confirmation window
+         int scanLimit = swingBar - LTFSwingStrength;
+         if(scanLimit <= 1) continue;
+
+         for(int b = 1; b < scanLimit; b++)
          {
             bool broken = false;
             switch(BOSBreakMethod)
@@ -920,7 +940,11 @@ bool DetectBOS(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double poin
          int    swingBar  = st.ltfSwingHighs[i].barIndex;
          if(MathAbs(swingHigh - st.chochLevel) < minBOS) continue;
 
-         for(int b = 1; b < swingBar; b++)
+         // Scan only bars OUTSIDE the swing's confirmation window
+         int scanLimit = swingBar - LTFSwingStrength;
+         if(scanLimit <= 1) continue;
+
+         for(int b = 1; b < scanLimit; b++)
          {
             bool broken = false;
             switch(BOSBreakMethod)
