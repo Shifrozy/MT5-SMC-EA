@@ -232,42 +232,43 @@ input ENUM_TIMEFRAMES LTF_Timeframe            = PERIOD_M5;     // Lower Timefra
 
 input group "══════ Swing Detection ══════"
 input int             SwingLookback            = 100;           // HTF Bars To Scan
-input int             HTFSwingStrength         = 5;             // HTF Swing Strength (bars each side)
-input int             LTFSwingStrength         = 3;             // LTF Swing Strength (bars each side)
-input int             MinSwingDistPoints       = 100;           // Min Swing Distance (points)
-input int             LiquidityTolPoints       = 15;            // Equal High/Low Tolerance (points)
+input int             HTFSwingStrength         = 3;             // HTF Swing Strength (bars each side)
+input int             LTFSwingStrength         = 2;             // LTF Swing Strength (bars each side)
+input int             MinSwingDistPoints       = 30;            // Min Swing Distance (points)
+input int             LiquidityTolPoints       = 10;            // Equal High/Low Tolerance (points)
 
 input group "══════ Liquidity Sweep ══════"
-input int             SweepBufferPoints        = 5;             // Sweep Buffer (points above/below)
-input int             MinSweepDistPoints       = 10;            // Min Sweep Penetration (points)
-input ENUM_SWEEP_MODE SweepConfirmationMode    = SWEEP_WICK_AND_CLOSE; // Sweep Confirmation
+input int             SweepBufferPoints        = 2;             // Sweep Buffer (points above/below)
+input int             MinSweepDistPoints       = 3;             // Min Sweep Penetration (points)
+input ENUM_SWEEP_MODE SweepConfirmationMode    = SWEEP_WICK_ONLY; // Sweep Confirmation
+input int             SweepLookbackBars        = 20;            // Sweep Check Window (HTF bars)
 
 input group "══════ Structure (CHoCH) ══════"
 input ENUM_BREAK_METHOD StructureBreakMethod   = BREAK_BODY_CLOSE;  // Break Confirmation Method
-input int             MinBreakDistPoints       = 5;             // Min Break Distance (points)
-input double          MinDisplacementATR       = 1.0;           // Min Displacement (× ATR)
+input int             MinBreakDistPoints       = 3;             // Min Break Distance (points)
+input double          MinDisplacementATR       = 0.3;           // Min Displacement (× ATR)
 input int             ATRPeriod                = 14;            // ATR Period
 
 input group "══════ BOS ══════"
 input bool            RequireSecondBOS         = false;         // Require Additional BOS
-input int             BOSMinDistPoints         = 5;             // BOS Min Distance (points)
+input int             BOSMinDistPoints         = 3;             // BOS Min Distance (points)
 input ENUM_BREAK_METHOD BOSBreakMethod         = BREAK_BODY_CLOSE;  // BOS Confirmation Method
 
 input group "══════ Order Block ══════"
 input int             OBLookbackCandles        = 10;            // OB Lookback (candles before displacement)
 input bool            OBUseBodyOnly            = false;         // Use Body Only (vs Full Candle)
-input int             OBMinSizePoints          = 5;             // OB Min Size (points)
-input int             OBMaxAgeBars             = 200;           // OB Max Age (LTF bars)
+input int             OBMinSizePoints          = 3;             // OB Min Size (points)
+input int             OBMaxAgeBars             = 500;           // OB Max Age (LTF bars)
 
 input group "══════ Fair Value Gap ══════"
-input int             MinFVGSizePoints         = 5;             // FVG Min Size (points)
-input int             MaxFVGSizePoints         = 500;           // FVG Max Size (points)
-input double          FVGMitigationPct         = 50.0;          // FVG Mitigation % (invalidation)
-input int             FVGExpiryBars            = 100;           // FVG Expiry (LTF bars)
+input int             MinFVGSizePoints         = 3;             // FVG Min Size (points)
+input int             MaxFVGSizePoints         = 1000;          // FVG Max Size (points)
+input double          FVGMitigationPct         = 70.0;          // FVG Mitigation % (invalidation)
+input int             FVGExpiryBars            = 300;           // FVG Expiry (LTF bars)
 
 input group "══════ Confluence ══════"
-input bool            RequireOBFVGConfluence   = true;          // Require OB+FVG Overlap
-input int             MinOverlapPoints         = 3;             // Min Overlap Size (points)
+input bool            RequireOBFVGConfluence   = false;         // Require OB+FVG Overlap
+input int             MinOverlapPoints         = 2;             // Min Overlap Size (points)
 input bool            AllowFVGOnlyEntry        = true;          // Allow FVG-Only Entry
 
 input group "══════ Entry ══════"
@@ -275,23 +276,23 @@ input ENUM_ENTRY_MODE EntryMode                = ENTRY_PENDING; // Entry Mode
 input int             NumberOfEntries          = 1;             // Number of Split Entries (1-10)
 input ENUM_VOLUME_DIST VolumeDist              = VOL_EQUAL;     // Volume Distribution
 
-input group "══════ Stop Loss ══════"
-input int             SLBufferPoints           = 10;            // SL Buffer Beyond OB (points)
+input group "══════ Capital Protection ══════"
+input int             SLBufferPoints           = 10;            // Protection Buffer Beyond OB (points)
 
 input group "══════ Take Profit ══════"
 input ENUM_TP_MODE    TPMode                   = TP_RISK_REWARD;// TP Mode
-input double          RiskRewardRatio          = 2.0;           // Risk:Reward Ratio
+input double          RiskRewardRatio          = 3.0;           // Risk:Reward Ratio
 input int             FixedTPPoints            = 500;           // Fixed TP (points)
 
 input group "══════ Risk Management ══════"
 input double          RiskPercentPerSetup      = 1.0;           // Risk % Per Setup
 input double          MaxAccountRiskPct        = 5.0;           // Max Total Account Risk %
-input int             MaxOpenTrades            = 3;             // Max Simultaneous Open Trades
-input double          MaxDailyLossPct          = 3.0;           // Max Daily Loss %
-input int             MaxDailyTrades           = 5;             // Max Daily Trades
+input int             MaxOpenTrades            = 5;             // Max Simultaneous Open Trades
+input double          DailyRiskLimitPct        = 5.0;           // Daily Risk Limit %
+input int             MaxDailyTrades           = 10;            // Max Daily Trades
 
 input group "══════ Position Management ══════"
-input bool            EnablePartialClose       = false;         // Enable Partial Close
+input bool            EnablePartialClose       = true;          // Enable Partial Close
 input double          PartialClosePct          = 50.0;          // Partial Close % of Volume
 input bool            MoveSLToBreakEven        = true;          // Move SL to Break-Even at 1R
 input int             TrailingStopPoints       = 0;             // Trailing Stop (points, 0=off)
@@ -310,12 +311,12 @@ input int             News2Minute              = 0;             // News Event 2 
 input int             NewsBlackoutMins         = 30;            // Blackout Window (mins each side)
 
 input group "══════ Protection ══════"
-input int             MaxSpreadPoints          = 30;            // Max Allowed Spread (points)
+input int             MaxSpreadPoints          = 50;            // Max Allowed Spread (points)
 input int             Slippage                 = 10;            // Max Slippage (points)
 input double          MinFreeMarginPct         = 50.0;          // Min Free Margin %
 
 input group "══════ Setup Expiry ══════"
-input int             SetupExpirationBars      = 100;           // Setup Expiry (LTF bars)
+input int             SetupExpirationBars      = 500;           // Setup Expiry (LTF bars)
 
 input group "══════ Multi-Symbol ══════"
 input bool            EnableMultiSymbol        = false;         // Enable Multi-Symbol
@@ -655,7 +656,7 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
       if(st.buySideLiq[l].swept) continue;
       double level = st.buySideLiq[l].price;
 
-      for(int b = 1; b <= 3 && b < htfCount; b++)
+      for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
       {
          bool swept = false;
          double penetration = htfRates[b].high - level;
@@ -702,7 +703,7 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
       if(st.sellSideLiq[l].swept) continue;
       double level = st.sellSideLiq[l].price;
 
-      for(int b = 1; b <= 3 && b < htfCount; b++)
+      for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
       {
          bool swept = false;
          double penetration = level - htfRates[b].low;
@@ -1304,12 +1305,12 @@ void UpdateDailyStats(SSymbolState &st)
    st.dailyTradeCount = dealsCount;
 }
 
-// Check if daily loss limit has been reached
+// Check if daily risk limit has been reached
 bool IsDailyLossExceeded(SSymbolState &st)
 {
    if(st.dayStartBalance <= 0) return false;
    double lossPct = -st.dailyPnL / st.dayStartBalance * 100.0;
-   return (lossPct >= MaxDailyLossPct && MaxDailyLossPct > 0);
+   return (lossPct >= DailyRiskLimitPct && DailyRiskLimitPct > 0);
 }
 
 // Comprehensive pre-trade checks
@@ -2277,31 +2278,31 @@ void ProcessSymbol(int si)
    // Update daily stats
    UpdateDailyStats(g_states[si]);
 
-   // Check daily loss
+   // Check daily risk limit
    if(IsDailyLossExceeded(g_states[si]))
    {
       if(g_states[si].currentState == STATE_ORDERS_PLACED)
       {
          DeletePendingOrders(g_states[si]);
          g_states[si].currentState = STATE_SETUP_INVALIDATED;
-         LogWarn(StringFormat("%s Daily loss limit reached — orders cancelled", sym));
+         LogWarn(StringFormat("%s Daily risk limit reached — orders cancelled", sym));
       }
       else if(g_states[si].currentState < STATE_POSITION_ACTIVE)
       {
          g_states[si].currentState = STATE_SETUP_INVALIDATED;
       }
-      // Don't close active positions on daily loss — just prevent new ones
+      // Don't close active positions on daily risk limit — just prevent new ones
    }
 
    // New bar checks
    bool newHTFBar = IsNewBar(sym, HTF_Timeframe, g_states[si].htfLastBarTime);
    bool newLTFBar = IsNewBar(sym, LTF_Timeframe, g_states[si].ltfLastBarTime);
 
-   // Copy HTF rates (on new HTF bar or when needed)
+   // Copy HTF rates (only on new HTF bar — avoids redundant recalculation on every tick)
    MqlRates htfRates[];
    int htfCount = 0;
    ArraySetAsSeries(htfRates, true);
-   if(newHTFBar || g_states[si].currentState == STATE_WAITING_FOR_LIQUIDITY)
+   if(newHTFBar)
    {
       htfCount = CopyRates(sym, HTF_Timeframe, 0, SwingLookback + HTFSwingStrength + 10, htfRates);
    }
