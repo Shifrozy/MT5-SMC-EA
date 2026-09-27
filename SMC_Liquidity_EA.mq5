@@ -232,8 +232,8 @@ input ENUM_TIMEFRAMES LTF_Timeframe            = PERIOD_M5;     // Lower Timefra
 
 input group "══════ Swing Detection ══════"
 input int             SwingLookback            = 100;           // HTF Bars To Scan
-input int             HTFSwingStrength         = 3;             // HTF Swing Strength (bars each side)
-input int             LTFSwingStrength         = 2;             // LTF Swing Strength (bars each side)
+input int             HTFSwingStrength         = 2;             // HTF Swing Strength (bars each side)
+input int             LTFSwingStrength         = 1;             // LTF Swing Strength (bars each side)
 input int             MinSwingDistPoints       = 30;            // Min Swing Distance (points)
 input int             LiquidityTolPoints       = 10;            // Equal High/Low Tolerance (points)
 
@@ -244,9 +244,9 @@ input ENUM_SWEEP_MODE SweepConfirmationMode    = SWEEP_WICK_ONLY; // Sweep Confi
 input int             SweepLookbackBars        = 20;            // Sweep Check Window (HTF bars)
 
 input group "══════ Structure (CHoCH) ══════"
-input ENUM_BREAK_METHOD StructureBreakMethod   = BREAK_BODY_CLOSE;  // Break Confirmation Method
+input ENUM_BREAK_METHOD StructureBreakMethod   = BREAK_WICK;        // Break Confirmation Method
 input int             MinBreakDistPoints       = 3;             // Min Break Distance (points)
-input double          MinDisplacementATR       = 0.3;           // Min Displacement (× ATR)
+input double          MinDisplacementATR       = 0.1;           // Min Displacement (× ATR)
 input int             ATRPeriod                = 14;            // ATR Period
 
 input group "══════ BOS ══════"
@@ -272,7 +272,7 @@ input int             MinOverlapPoints         = 2;             // Min Overlap S
 input bool            AllowFVGOnlyEntry        = true;          // Allow FVG-Only Entry
 
 input group "══════ Entry ══════"
-input ENUM_ENTRY_MODE EntryMode                = ENTRY_PENDING; // Entry Mode
+input ENUM_ENTRY_MODE EntryMode                = ENTRY_MARKET;  // Entry Mode
 input int             NumberOfEntries          = 1;             // Number of Split Entries (1-10)
 input ENUM_VOLUME_DIST VolumeDist              = VOL_EQUAL;     // Volume Distribution
 
@@ -281,7 +281,7 @@ input int             SLBufferPoints           = 10;            // Protection Bu
 
 input group "══════ Take Profit ══════"
 input ENUM_TP_MODE    TPMode                   = TP_RISK_REWARD;// TP Mode
-input double          RiskRewardRatio          = 3.0;           // Risk:Reward Ratio
+input double          RiskRewardRatio          = 2.0;           // Risk:Reward Ratio
 input int             FixedTPPoints            = 500;           // Fixed TP (points)
 
 input group "══════ Risk Management ══════"
@@ -316,7 +316,7 @@ input int             Slippage                 = 10;            // Max Slippage 
 input double          MinFreeMarginPct         = 50.0;          // Min Free Margin %
 
 input group "══════ Setup Expiry ══════"
-input int             SetupExpirationBars      = 500;           // Setup Expiry (LTF bars)
+input int             SetupExpirationBars      = 2000;          // Setup Expiry (LTF bars)
 
 input group "══════ Multi-Symbol ══════"
 input bool            EnableMultiSymbol        = false;         // Enable Multi-Symbol
@@ -751,60 +751,97 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
 //╚═══════════════════════════════════════════════════════════════════╝
 
 // Detect CHoCH on LTF after a liquidity sweep.
-// Bearish CHoCH: after buy-side sweep → price breaks below recent LTF swing low
-// Bullish CHoCH: after sell-side sweep → price breaks above recent LTF swing high
+// NEW APPROACH: Instead of relying on swing points (which have confirmation-window
+// overlap issues), we directly find the lowest low / highest high in a lookback
+// range, then check if a more recent bar broke that level with displacement.
+// This is more robust and guarantees detection when structure actually changes.
 bool DetectCHoCH(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double pointVal)
 {
    double minBreak = MinBreakDistPoints * pointVal;
+   
+   // We need at least a few bars to work with
+   int lookback = MathMin(ltfCount - 1, 50); // Scan up to 50 LTF bars for structure
+   if(lookback < 4) return false;
 
    if(st.bias == DIR_BEARISH)
    {
-      if(st.ltfSwingLowCount == 0) return false;
+      // BEARISH CHoCH: After buy-side sweep, find a recent swing low and check
+      // if a NEWER bar broke below it with a displacement candle.
+      
+      // Step 1: Find the lowest low in bars 3..lookback (the "structure low")
+      // Start from bar 3 to ensure there are recent bars that could break it
+      double structureLow = DBL_MAX;
+      int    structureBar = -1;
+      
+      for(int i = 3; i <= lookback; i++)
+      {
+         if(ltfRates[i].low < structureLow)
+         {
+            structureLow = ltfRates[i].low;
+            structureBar = i;
+         }
+      }
+      
+      if(structureBar < 0) return false;
+      
+      // Step 2: Check if any bar between 1 and structureBar-1 broke below this low
+      for(int b = 1; b < structureBar && b < ltfCount; b++)
+      {
+         bool broken = false;
+         switch(StructureBreakMethod)
+         {
+            case BREAK_WICK:
+               broken = (ltfRates[b].low < structureLow - minBreak);
+               break;
+            case BREAK_CANDLE_CLOSE:
+               broken = (ltfRates[b].close < structureLow - minBreak);
+               break;
+            case BREAK_BODY_CLOSE:
+               broken = (MathMin(ltfRates[b].open, ltfRates[b].close) < structureLow - minBreak);
+               break;
+         }
 
-      // Iterate ALL detected swing lows — the most recent swing's confirmation
-      // window overlaps with our scan window, making it impossible to detect a break.
-      // Older swings have post-confirmation bars available for break detection.
+         if(broken)
+         {
+            bool isBearishCandle = (ltfRates[b].close < ltfRates[b].open);
+            double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
+
+            if(isBearishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+            {
+               st.chochLevel       = structureLow;
+               st.chochBar         = b;
+               st.chochTime        = ltfRates[b].time;
+               st.displacementBar  = b;
+
+               LogInfo(StringFormat("%s Bearish CHoCH at %.5f (break bar %d, struct bar %d, body=%.5f, ATR=%.5f)",
+                                    st.symbol, structureLow, b, structureBar, bodySize, st.currentATR_LTF));
+               return true;
+            }
+         }
+      }
+      
+      // Also try with swing points as fallback (for older swings with post-confirmation bars)
       for(int swIdx = 0; swIdx < st.ltfSwingLowCount; swIdx++)
       {
          double swingLow  = st.ltfSwingLows[swIdx].price;
          int    swingBar  = st.ltfSwingLows[swIdx].barIndex;
-
-         // Limit scan to bars OUTSIDE the swing's confirmation window.
-         // With swingStr=S, the confirmation uses bars swingBar-1 down to swingBar-S.
-         // So the safe scan range ends at swingBar - LTFSwingStrength.
          int scanLimit = swingBar - LTFSwingStrength;
-         if(scanLimit <= 1) continue; // No post-confirmation bars available — skip
+         if(scanLimit <= 1) continue;
 
          for(int b = 1; b < scanLimit && b < ltfCount; b++)
          {
-            bool broken = false;
-            switch(StructureBreakMethod)
-            {
-               case BREAK_WICK:
-                  broken = (ltfRates[b].low < swingLow - minBreak);
-                  break;
-               case BREAK_CANDLE_CLOSE:
-                  broken = (ltfRates[b].close < swingLow - minBreak);
-                  break;
-               case BREAK_BODY_CLOSE:
-                  broken = (MathMin(ltfRates[b].open, ltfRates[b].close) < swingLow - minBreak);
-                  break;
-            }
-
+            bool broken = (ltfRates[b].low < swingLow - minBreak);
             if(broken)
             {
                bool isBearishCandle = (ltfRates[b].close < ltfRates[b].open);
                double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
-
                if(isBearishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
                {
                   st.chochLevel       = swingLow;
                   st.chochBar         = b;
                   st.chochTime        = ltfRates[b].time;
                   st.displacementBar  = b;
-
-                  LogInfo(StringFormat("%s Bearish CHoCH at %.5f (bar %d, swing bar %d, body=%.5f, ATR=%.5f)",
-                                       st.symbol, swingLow, b, swingBar, bodySize, st.currentATR_LTF));
+                  LogInfo(StringFormat("%s Bearish CHoCH (swing) at %.5f (bar %d)", st.symbol, swingLow, b));
                   return true;
                }
             }
@@ -813,46 +850,78 @@ bool DetectCHoCH(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double po
    }
    else if(st.bias == DIR_BULLISH)
    {
-      if(st.ltfSwingHighCount == 0) return false;
+      // BULLISH CHoCH: After sell-side sweep, find the structure high and check break above
+      double structureHigh = -DBL_MAX;
+      int    structureBar  = -1;
+      
+      for(int i = 3; i <= lookback; i++)
+      {
+         if(ltfRates[i].high > structureHigh)
+         {
+            structureHigh = ltfRates[i].high;
+            structureBar  = i;
+         }
+      }
+      
+      if(structureBar < 0) return false;
+      
+      for(int b = 1; b < structureBar && b < ltfCount; b++)
+      {
+         bool broken = false;
+         switch(StructureBreakMethod)
+         {
+            case BREAK_WICK:
+               broken = (ltfRates[b].high > structureHigh + minBreak);
+               break;
+            case BREAK_CANDLE_CLOSE:
+               broken = (ltfRates[b].close > structureHigh + minBreak);
+               break;
+            case BREAK_BODY_CLOSE:
+               broken = (MathMax(ltfRates[b].open, ltfRates[b].close) > structureHigh + minBreak);
+               break;
+         }
 
+         if(broken)
+         {
+            bool isBullishCandle = (ltfRates[b].close > ltfRates[b].open);
+            double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
+
+            if(isBullishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+            {
+               st.chochLevel       = structureHigh;
+               st.chochBar         = b;
+               st.chochTime        = ltfRates[b].time;
+               st.displacementBar  = b;
+
+               LogInfo(StringFormat("%s Bullish CHoCH at %.5f (break bar %d, struct bar %d, body=%.5f, ATR=%.5f)",
+                                    st.symbol, structureHigh, b, structureBar, bodySize, st.currentATR_LTF));
+               return true;
+            }
+         }
+      }
+      
+      // Swing-based fallback
       for(int swIdx = 0; swIdx < st.ltfSwingHighCount; swIdx++)
       {
          double swingHigh = st.ltfSwingHighs[swIdx].price;
          int    swingBar  = st.ltfSwingHighs[swIdx].barIndex;
-
          int scanLimit = swingBar - LTFSwingStrength;
          if(scanLimit <= 1) continue;
 
          for(int b = 1; b < scanLimit && b < ltfCount; b++)
          {
-            bool broken = false;
-            switch(StructureBreakMethod)
-            {
-               case BREAK_WICK:
-                  broken = (ltfRates[b].high > swingHigh + minBreak);
-                  break;
-               case BREAK_CANDLE_CLOSE:
-                  broken = (ltfRates[b].close > swingHigh + minBreak);
-                  break;
-               case BREAK_BODY_CLOSE:
-                  broken = (MathMax(ltfRates[b].open, ltfRates[b].close) > swingHigh + minBreak);
-                  break;
-            }
-
+            bool broken = (ltfRates[b].high > swingHigh + minBreak);
             if(broken)
             {
                bool isBullishCandle = (ltfRates[b].close > ltfRates[b].open);
                double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
-
                if(isBullishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
                {
                   st.chochLevel       = swingHigh;
                   st.chochBar         = b;
                   st.chochTime        = ltfRates[b].time;
                   st.displacementBar  = b;
-
-                  LogInfo(StringFormat("%s Bullish CHoCH at %.5f (bar %d, swing bar %d, body=%.5f, ATR=%.5f)",
-                                       st.symbol, swingHigh, b, swingBar, bodySize, st.currentATR_LTF));
+                  LogInfo(StringFormat("%s Bullish CHoCH (swing) at %.5f (bar %d)", st.symbol, swingHigh, b));
                   return true;
                }
             }
@@ -861,6 +930,7 @@ bool DetectCHoCH(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double po
    }
    return false;
 }
+
 
 //╔═══════════════════════════════════════════════════════════════════╗
 //║                BOS DETECTION (Break of Structure)                ║
@@ -2322,11 +2392,12 @@ void ProcessSymbol(int si)
    bool newHTFBar = IsNewBar(sym, HTF_Timeframe, g_states[si].htfLastBarTime);
    bool newLTFBar = IsNewBar(sym, LTF_Timeframe, g_states[si].ltfLastBarTime);
 
-   // Copy HTF rates (only on new HTF bar — avoids redundant recalculation on every tick)
+   // Copy HTF rates — load on every new LTF bar too (not just new HTF bar)
+   // This prevents dead-time after state resets where htfCount=0
    MqlRates htfRates[];
    int htfCount = 0;
    ArraySetAsSeries(htfRates, true);
-   if(newHTFBar)
+   if(newHTFBar || newLTFBar || g_states[si].currentState == STATE_WAITING_FOR_LIQUIDITY)
    {
       htfCount = CopyRates(sym, HTF_Timeframe, 0, SwingLookback + HTFSwingStrength + 10, htfRates);
    }
@@ -2599,16 +2670,18 @@ void ProcessSymbol(int si)
                break;
             }
 
-            // Check if POI has been invalidated (price broke through OB in wrong direction)
             double bid = SymbolInfoDouble(sym, SYMBOL_BID);
             double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+            
+            // POI invalidation: use 2x ATR as threshold (robust for all instruments)
+            double invalidationDist = g_states[si].currentATR_LTF * 2.0;
+            if(invalidationDist <= 0) invalidationDist = SLBufferPoints * point * 10; // fallback
 
             if(g_states[si].bias == DIR_BEARISH)
             {
-               // If price goes significantly above the OB, invalidate
-               if(ask > g_states[si].obHigh + SLBufferPoints * point * 2)
+               if(ask > g_states[si].obHigh + invalidationDist)
                {
-                  LogInfo(StringFormat("%s POI invalidated: price above OB", sym));
+                  LogInfo(StringFormat("%s POI invalidated: price above OB by %.5f", sym, ask - g_states[si].obHigh));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                   break;
@@ -2616,9 +2689,9 @@ void ProcessSymbol(int si)
             }
             else
             {
-               if(bid < g_states[si].obLow - SLBufferPoints * point * 2)
+               if(bid < g_states[si].obLow - invalidationDist)
                {
-                  LogInfo(StringFormat("%s POI invalidated: price below OB", sym));
+                  LogInfo(StringFormat("%s POI invalidated: price below OB by %.5f", sym, g_states[si].obLow - bid));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                   break;
@@ -2641,28 +2714,18 @@ void ProcessSymbol(int si)
                   stateChanged = true;
                }
             }
-            else // ENTRY_MARKET
+            else // ENTRY_MARKET — enter IMMEDIATELY at market price
             {
-               // Wait for price to enter the POI zone
-               bool priceInZone = false;
-               if(g_states[si].bias == DIR_BEARISH)
-                  priceInZone = (bid >= g_states[si].poiLow && bid <= g_states[si].poiHigh);
-               else
-                  priceInZone = (ask >= g_states[si].poiLow && ask <= g_states[si].poiHigh);
-
-               if(priceInZone)
+               DrawEntryLevels(g_states[si]);
+               if(ExecuteMarketEntry(g_states[si], point))
                {
-                  DrawEntryLevels(g_states[si]);
-                  if(ExecuteMarketEntry(g_states[si], point))
-                  {
-                     g_states[si].currentState = STATE_POSITION_ACTIVE;
-                     stateChanged = true;
-                  }
-                  else
-                  {
-                     g_states[si].currentState = STATE_SETUP_INVALIDATED;
-                     stateChanged = true;
-                  }
+                  g_states[si].currentState = STATE_POSITION_ACTIVE;
+                  stateChanged = true;
+               }
+               else
+               {
+                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                  stateChanged = true;
                }
             }
             break;
@@ -2771,7 +2834,8 @@ void ProcessSymbol(int si)
          {
             ResetSetup(g_states[si]);
             LogDebug(StringFormat("%s State machine reset — scanning for new setup", sym));
-            // Don't set stateChanged — let the next tick handle the new scan
+            // Immediately transition to scanning for new liquidity
+            stateChanged = true;
             break;
          }
       }
