@@ -271,13 +271,13 @@ input bool            RequireOBFVGConfluence   = false;         // Require OB+FV
 input int             MinOverlapPoints         = 2;             // Min Overlap Size (points)
 input bool            AllowFVGOnlyEntry        = true;          // Allow FVG-Only Entry
 
-input group "══════ Entry ══════"
-input ENUM_ENTRY_MODE EntryMode                = ENTRY_MARKET;  // Entry Mode
-input int             NumberOfEntries          = 1;             // Number of Split Entries (1-10)
+input group "══════ Entry & Grid ══════"
+input ENUM_ENTRY_MODE EntryMode                = ENTRY_HYBRID;  // Entry Mode (HYBRID=Market+Grid, MARKET, PENDING)
+input int             NumberOfEntries          = 3;             // Number of Split Entries (Grid 1-10)
 input ENUM_VOLUME_DIST VolumeDist              = VOL_EQUAL;     // Volume Distribution
 
 input group "══════ Capital Protection ══════"
-input int             SLBufferPoints           = 10;            // Protection Buffer Beyond OB (points)
+input int             SLBufferPoints           = 20;            // Protection Buffer Beyond POI (points)
 
 input group "══════ Take Profit ══════"
 input ENUM_TP_MODE    TPMode                   = TP_RISK_REWARD;// TP Mode
@@ -285,11 +285,13 @@ input double          RiskRewardRatio          = 2.0;           // Risk:Reward R
 input int             FixedTPPoints            = 500;           // Fixed TP (points)
 
 input group "══════ Risk Management ══════"
+input bool            UseFixedLot              = false;         // Use Fixed Lot (true=Fixed Lot, false=Risk %)
+input double          FixedLotSize             = 0.01;          // Fixed Lot Size
 input double          RiskPercentPerSetup      = 1.0;           // Risk % Per Setup
 input double          MaxAccountRiskPct        = 5.0;           // Max Total Account Risk %
-input int             MaxOpenTrades            = 5;             // Max Simultaneous Open Trades
+input int             MaxOpenTrades            = 10;            // Max Simultaneous Open Trades
 input double          DailyRiskLimitPct        = 5.0;           // Daily Risk Limit %
-input int             MaxDailyTrades           = 10;            // Max Daily Trades
+input int             MaxDailyTrades           = 20;            // Max Daily Trades
 
 input group "══════ Position Management ══════"
 input bool            EnablePartialClose       = true;          // Enable Partial Close
@@ -751,185 +753,154 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
 //╚═══════════════════════════════════════════════════════════════════╝
 
 // Detect CHoCH on LTF after a liquidity sweep.
-// NEW APPROACH: Instead of relying on swing points (which have confirmation-window
-// overlap issues), we directly find the lowest low / highest high in a lookback
-// range, then check if a more recent bar broke that level with displacement.
-// This is more robust and guarantees detection when structure actually changes.
+// SIMPLE & AGGRESSIVE: Check if bar 1 made a lower low (bearish) or higher high (bullish)
+// compared to recent bars. Uses small lookback for frequent signals on Gold.
 bool DetectCHoCH(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double pointVal)
 {
    double minBreak = MinBreakDistPoints * pointVal;
-   
-   // We need at least a few bars to work with
-   int lookback = MathMin(ltfCount - 1, 50); // Scan up to 50 LTF bars for structure
-   if(lookback < 4) return false;
+   if(ltfCount < 5) return false;
+
+   double reqBody = MinDisplacementATR * st.currentATR_LTF;
+   if(reqBody <= 0) reqBody = 5 * pointVal;
 
    if(st.bias == DIR_BEARISH)
    {
-      // BEARISH CHoCH: After buy-side sweep, find a recent swing low and check
-      // if a NEWER bar broke below it with a displacement candle.
-      
-      // Step 1: Find the lowest low in bars 3..lookback (the "structure low")
-      // Start from bar 3 to ensure there are recent bars that could break it
-      double structureLow = DBL_MAX;
-      int    structureBar = -1;
-      
-      for(int i = 3; i <= lookback; i++)
+      // Method 1: Bar 1 made a lower low than bars 2-5 (new 5-bar low)
+      for(int ref = 2; ref <= MathMin(5, ltfCount - 1); ref++)
       {
-         if(ltfRates[i].low < structureLow)
+         if(ltfRates[1].low < ltfRates[ref].low - minBreak)
          {
-            structureLow = ltfRates[i].low;
-            structureBar = i;
-         }
-      }
-      
-      if(structureBar < 0) return false;
-      
-      // Step 2: Check if any bar between 1 and structureBar-1 broke below this low
-      for(int b = 1; b < structureBar && b < ltfCount; b++)
-      {
-         bool broken = false;
-         switch(StructureBreakMethod)
-         {
-            case BREAK_WICK:
-               broken = (ltfRates[b].low < structureLow - minBreak);
-               break;
-            case BREAK_CANDLE_CLOSE:
-               broken = (ltfRates[b].close < structureLow - minBreak);
-               break;
-            case BREAK_BODY_CLOSE:
-               broken = (MathMin(ltfRates[b].open, ltfRates[b].close) < structureLow - minBreak);
-               break;
-         }
+            bool isBearish = (ltfRates[1].close < ltfRates[1].open);
+            double bodySize = MathAbs(ltfRates[1].close - ltfRates[1].open);
 
-         if(broken)
-         {
-            bool isBearishCandle = (ltfRates[b].close < ltfRates[b].open);
-            double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
-
-            if(isBearishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+            if(isBearish && (bodySize >= reqBody || bodySize >= 2 * pointVal))
             {
-               st.chochLevel       = structureLow;
-               st.chochBar         = b;
-               st.chochTime        = ltfRates[b].time;
-               st.displacementBar  = b;
+               st.chochLevel       = ltfRates[ref].low;
+               st.chochBar         = 1;
+               st.chochTime        = ltfRates[1].time;
+               st.displacementBar  = 1;
 
-               LogInfo(StringFormat("%s Bearish CHoCH at %.5f (break bar %d, struct bar %d, body=%.5f, ATR=%.5f)",
-                                    st.symbol, structureLow, b, structureBar, bodySize, st.currentATR_LTF));
+               LogInfo(StringFormat("%s BEARISH CHoCH: bar1 low=%.3f broke below bar%d low=%.3f (body=%.3f)",
+                                    st.symbol, ltfRates[1].low, ref, ltfRates[ref].low, bodySize));
                return true;
             }
          }
       }
       
-      // Also try with swing points as fallback (for older swings with post-confirmation bars)
-      for(int swIdx = 0; swIdx < st.ltfSwingLowCount; swIdx++)
+      // Method 2: Bar 2 made a lower low than bars 3-6 
+      for(int ref = 3; ref <= MathMin(6, ltfCount - 1); ref++)
       {
-         double swingLow  = st.ltfSwingLows[swIdx].price;
-         int    swingBar  = st.ltfSwingLows[swIdx].barIndex;
-         int scanLimit = swingBar - LTFSwingStrength;
-         if(scanLimit <= 1) continue;
-
-         for(int b = 1; b < scanLimit && b < ltfCount; b++)
+         if(ltfRates[2].low < ltfRates[ref].low - minBreak)
          {
-            bool broken = (ltfRates[b].low < swingLow - minBreak);
-            if(broken)
+            bool isBearish = (ltfRates[2].close < ltfRates[2].open);
+            double bodySize = MathAbs(ltfRates[2].close - ltfRates[2].open);
+
+            if(isBearish && (bodySize >= reqBody || bodySize >= 2 * pointVal))
             {
-               bool isBearishCandle = (ltfRates[b].close < ltfRates[b].open);
-               double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
-               if(isBearishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
-               {
-                  st.chochLevel       = swingLow;
-                  st.chochBar         = b;
-                  st.chochTime        = ltfRates[b].time;
-                  st.displacementBar  = b;
-                  LogInfo(StringFormat("%s Bearish CHoCH (swing) at %.5f (bar %d)", st.symbol, swingLow, b));
-                  return true;
-               }
+               st.chochLevel       = ltfRates[ref].low;
+               st.chochBar         = 2;
+               st.chochTime        = ltfRates[2].time;
+               st.displacementBar  = 2;
+
+               LogInfo(StringFormat("%s BEARISH CHoCH: bar2 low=%.3f broke below bar%d low=%.3f",
+                                    st.symbol, ltfRates[2].low, ref, ltfRates[ref].low));
+               return true;
+            }
+         }
+      }
+
+      // Method 3: Break of recent confirmed LTF swing low
+      for(int s = 0; s < st.ltfSwingLowCount; s++)
+      {
+         if(st.ltfSwingLows[s].barIndex >= 2 && st.ltfSwingLows[s].barIndex <= 25)
+         {
+            double swLow = st.ltfSwingLows[s].price;
+            if(ltfRates[1].low < swLow - minBreak || ltfRates[2].low < swLow - minBreak)
+            {
+               int bIdx = (ltfRates[1].low < swLow - minBreak) ? 1 : 2;
+               st.chochLevel       = swLow;
+               st.chochBar         = bIdx;
+               st.chochTime        = ltfRates[bIdx].time;
+               st.displacementBar  = bIdx;
+
+               LogInfo(StringFormat("%s BEARISH CHoCH (swing): bar%d low broke below swing low %.3f",
+                                    st.symbol, bIdx, swLow));
+               return true;
             }
          }
       }
    }
    else if(st.bias == DIR_BULLISH)
    {
-      // BULLISH CHoCH: After sell-side sweep, find the structure high and check break above
-      double structureHigh = -DBL_MAX;
-      int    structureBar  = -1;
-      
-      for(int i = 3; i <= lookback; i++)
+      // Method 1: Bar 1 made a higher high than bars 2-5
+      for(int ref = 2; ref <= MathMin(5, ltfCount - 1); ref++)
       {
-         if(ltfRates[i].high > structureHigh)
+         if(ltfRates[1].high > ltfRates[ref].high + minBreak)
          {
-            structureHigh = ltfRates[i].high;
-            structureBar  = i;
-         }
-      }
-      
-      if(structureBar < 0) return false;
-      
-      for(int b = 1; b < structureBar && b < ltfCount; b++)
-      {
-         bool broken = false;
-         switch(StructureBreakMethod)
-         {
-            case BREAK_WICK:
-               broken = (ltfRates[b].high > structureHigh + minBreak);
-               break;
-            case BREAK_CANDLE_CLOSE:
-               broken = (ltfRates[b].close > structureHigh + minBreak);
-               break;
-            case BREAK_BODY_CLOSE:
-               broken = (MathMax(ltfRates[b].open, ltfRates[b].close) > structureHigh + minBreak);
-               break;
-         }
+            bool isBullish = (ltfRates[1].close > ltfRates[1].open);
+            double bodySize = MathAbs(ltfRates[1].close - ltfRates[1].open);
 
-         if(broken)
-         {
-            bool isBullishCandle = (ltfRates[b].close > ltfRates[b].open);
-            double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
-
-            if(isBullishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
+            if(isBullish && (bodySize >= reqBody || bodySize >= 2 * pointVal))
             {
-               st.chochLevel       = structureHigh;
-               st.chochBar         = b;
-               st.chochTime        = ltfRates[b].time;
-               st.displacementBar  = b;
+               st.chochLevel       = ltfRates[ref].high;
+               st.chochBar         = 1;
+               st.chochTime        = ltfRates[1].time;
+               st.displacementBar  = 1;
 
-               LogInfo(StringFormat("%s Bullish CHoCH at %.5f (break bar %d, struct bar %d, body=%.5f, ATR=%.5f)",
-                                    st.symbol, structureHigh, b, structureBar, bodySize, st.currentATR_LTF));
+               LogInfo(StringFormat("%s BULLISH CHoCH: bar1 high=%.3f broke above bar%d high=%.3f (body=%.3f)",
+                                    st.symbol, ltfRates[1].high, ref, ltfRates[ref].high, bodySize));
                return true;
             }
          }
       }
       
-      // Swing-based fallback
-      for(int swIdx = 0; swIdx < st.ltfSwingHighCount; swIdx++)
+      // Method 2: Bar 2 made a higher high than bars 3-6
+      for(int ref = 3; ref <= MathMin(6, ltfCount - 1); ref++)
       {
-         double swingHigh = st.ltfSwingHighs[swIdx].price;
-         int    swingBar  = st.ltfSwingHighs[swIdx].barIndex;
-         int scanLimit = swingBar - LTFSwingStrength;
-         if(scanLimit <= 1) continue;
-
-         for(int b = 1; b < scanLimit && b < ltfCount; b++)
+         if(ltfRates[2].high > ltfRates[ref].high + minBreak)
          {
-            bool broken = (ltfRates[b].high > swingHigh + minBreak);
-            if(broken)
+            bool isBullish = (ltfRates[2].close > ltfRates[2].open);
+            double bodySize = MathAbs(ltfRates[2].close - ltfRates[2].open);
+
+            if(isBullish && (bodySize >= reqBody || bodySize >= 2 * pointVal))
             {
-               bool isBullishCandle = (ltfRates[b].close > ltfRates[b].open);
-               double bodySize = MathAbs(ltfRates[b].close - ltfRates[b].open);
-               if(isBullishCandle && bodySize >= MinDisplacementATR * st.currentATR_LTF)
-               {
-                  st.chochLevel       = swingHigh;
-                  st.chochBar         = b;
-                  st.chochTime        = ltfRates[b].time;
-                  st.displacementBar  = b;
-                  LogInfo(StringFormat("%s Bullish CHoCH (swing) at %.5f (bar %d)", st.symbol, swingHigh, b));
-                  return true;
-               }
+               st.chochLevel       = ltfRates[ref].high;
+               st.chochBar         = 2;
+               st.chochTime        = ltfRates[2].time;
+               st.displacementBar  = 2;
+
+               LogInfo(StringFormat("%s BULLISH CHoCH: bar2 high=%.3f broke above bar%d high=%.3f",
+                                    st.symbol, ltfRates[2].high, ref, ltfRates[ref].high));
+               return true;
+            }
+         }
+      }
+
+      // Method 3: Break of recent confirmed LTF swing high
+      for(int s = 0; s < st.ltfSwingHighCount; s++)
+      {
+         if(st.ltfSwingHighs[s].barIndex >= 2 && st.ltfSwingHighs[s].barIndex <= 25)
+         {
+            double swHigh = st.ltfSwingHighs[s].price;
+            if(ltfRates[1].high > swHigh + minBreak || ltfRates[2].high > swHigh + minBreak)
+            {
+               int bIdx = (ltfRates[1].high > swHigh + minBreak) ? 1 : 2;
+               st.chochLevel       = swHigh;
+               st.chochBar         = bIdx;
+               st.chochTime        = ltfRates[bIdx].time;
+               st.displacementBar  = bIdx;
+
+               LogInfo(StringFormat("%s BULLISH CHoCH (swing): bar%d high broke above swing high %.3f",
+                                    st.symbol, bIdx, swHigh));
+               return true;
             }
          }
       }
    }
    return false;
 }
+
+
 
 
 //╔═══════════════════════════════════════════════════════════════════╗
@@ -1091,6 +1062,29 @@ bool DetectOrderBlock(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, doub
             }
          }
       }
+
+      // Fallback: Use the highest candle before displacement as the OB zone
+      double highestP = 0;
+      int highIdx = -1;
+      for(int i = dispBar + 1; i < dispBar + OBLookbackCandles + 1 && i < ltfCount; i++)
+      {
+         if(ltfRates[i].high > highestP)
+         {
+            highestP = ltfRates[i].high;
+            highIdx = i;
+         }
+      }
+      if(highIdx > 0)
+      {
+         st.obHigh      = ltfRates[highIdx].high;
+         st.obLow       = ltfRates[highIdx].low;
+         st.obTime      = ltfRates[highIdx].time;
+         st.obDirection = DIR_BEARISH;
+         st.obValid     = true;
+         LogInfo(StringFormat("%s Bearish OB (pivot fallback): %.5f - %.5f at %s",
+                              st.symbol, st.obHigh, st.obLow, TimeToString(ltfRates[highIdx].time)));
+         return true;
+      }
    }
    else if(st.bias == DIR_BULLISH)
    {
@@ -1116,6 +1110,29 @@ bool DetectOrderBlock(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, doub
                return true;
             }
          }
+      }
+
+      // Fallback: Use the lowest candle before displacement as the OB zone
+      double lowestP = DBL_MAX;
+      int lowIdx = -1;
+      for(int i = dispBar + 1; i < dispBar + OBLookbackCandles + 1 && i < ltfCount; i++)
+      {
+         if(ltfRates[i].low < lowestP)
+         {
+            lowestP = ltfRates[i].low;
+            lowIdx = i;
+         }
+      }
+      if(lowIdx > 0)
+      {
+         st.obHigh      = ltfRates[lowIdx].high;
+         st.obLow       = ltfRates[lowIdx].low;
+         st.obTime      = ltfRates[lowIdx].time;
+         st.obDirection = DIR_BULLISH;
+         st.obValid     = true;
+         LogInfo(StringFormat("%s Bullish OB (pivot fallback): %.5f - %.5f at %s",
+                              st.symbol, st.obHigh, st.obLow, TimeToString(ltfRates[lowIdx].time)));
+         return true;
       }
    }
 
@@ -1223,41 +1240,35 @@ bool CheckConfluence(SSymbolState &st, double pointVal)
                               st.symbol, ovlHigh, ovlLow, ovlSize / pointVal));
          return true;
       }
-      else if(AllowFVGOnlyEntry)
-      {
-         // No overlap but FVG-only allowed
-         st.poiHigh       = st.fvgHigh;
-         st.poiLow        = st.fvgLow;
-         st.hasConfluence  = false;
-         LogInfo(StringFormat("%s FVG-only POI (no overlap): %.5f - %.5f",
-                              st.symbol, st.fvgHigh, st.fvgLow));
-         return true;
-      }
       else
       {
-         LogWarn(StringFormat("%s Setup rejected: insufficient OB/FVG overlap (%.1f pts < %.1f pts)",
-                              st.symbol, ovlSize / pointVal, (double)MinOverlapPoints));
-         return false;
+         // No overlap: default to Order Block as primary POI zone
+         st.poiHigh       = st.obHigh;
+         st.poiLow        = st.obLow;
+         st.hasConfluence  = false;
+         LogInfo(StringFormat("%s OB primary POI (no overlap with FVG): %.5f - %.5f",
+                              st.symbol, st.obHigh, st.obLow));
+         return true;
       }
    }
-   else if(st.fvgValid && AllowFVGOnlyEntry)
-   {
-      st.poiHigh       = st.fvgHigh;
-      st.poiLow        = st.fvgLow;
-      st.hasConfluence  = false;
-      LogInfo(StringFormat("%s FVG-only POI (no OB): %.5f - %.5f", st.symbol, st.fvgHigh, st.fvgLow));
-      return true;
-   }
-   else if(st.obValid && !RequireOBFVGConfluence)
+   else if(st.obValid)
    {
       st.poiHigh       = st.obHigh;
       st.poiLow        = st.obLow;
       st.hasConfluence  = false;
-      LogInfo(StringFormat("%s OB-only POI (no FVG): %.5f - %.5f", st.symbol, st.obHigh, st.obLow));
+      LogInfo(StringFormat("%s OB-only POI: %.5f - %.5f", st.symbol, st.obHigh, st.obLow));
+      return true;
+   }
+   else if(st.fvgValid)
+   {
+      st.poiHigh       = st.fvgHigh;
+      st.poiLow        = st.fvgLow;
+      st.hasConfluence  = false;
+      LogInfo(StringFormat("%s FVG-only POI: %.5f - %.5f", st.symbol, st.fvgHigh, st.fvgLow));
       return true;
    }
 
-   LogWarn(StringFormat("%s Setup rejected: no valid POI zone", st.symbol));
+   LogWarn(StringFormat("%s Setup rejected: no valid POI zone found", st.symbol));
    return false;
 }
 
@@ -1268,24 +1279,45 @@ bool CheckConfluence(SSymbolState &st, double pointVal)
 // Calculate lot size based on risk percentage and SL distance
 double CalculateLotSize(string sym, double riskPct, double entryPrice, double slPrice)
 {
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   if(minLot <= 0) minLot = 0.01;
+
+   if(UseFixedLot && FixedLotSize > 0)
+      return NormalizeLots(sym, FixedLotSize);
+
    double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance <= 0) balance = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(balance <= 0) return NormalizeLots(sym, minLot);
+
    double riskAmt   = balance * riskPct / 100.0;
    double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
    double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
 
+   double slDist = MathAbs(entryPrice - slPrice);
+   if(slDist <= 0) return NormalizeLots(sym, minLot);
+
    if(tickSize <= 0 || tickValue <= 0)
    {
-      LogError(StringFormat("%s Invalid tick size/value: ts=%.10f tv=%.5f", sym, tickSize, tickValue));
-      return 0;
+      double point = SymPoint(sym);
+      if(point > 0)
+      {
+         double slPoints = slDist / point;
+         if(slPoints > 0)
+         {
+            double estLots = riskAmt / (slPoints * point * 100.0);
+            return NormalizeLots(sym, MathMax(minLot, estLots));
+         }
+      }
+      return NormalizeLots(sym, minLot);
    }
 
-   double slDist       = MathAbs(entryPrice - slPrice);
-   double slTicks      = slDist / tickSize;
-   double lossPerLot   = slTicks * tickValue;
+   double slTicks    = slDist / tickSize;
+   double lossPerLot = slTicks * tickValue;
 
-   if(lossPerLot <= 0) return 0;
+   if(lossPerLot <= 0) return NormalizeLots(sym, minLot);
 
    double lots = riskAmt / lossPerLot;
+   if(lots < minLot) lots = minLot;
    return NormalizeLots(sym, lots);
 }
 
@@ -1460,7 +1492,7 @@ bool PreTradeChecks(string sym, double lots, double entryPrice, double slPrice, 
    int stopsLevel = (int)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
    double point   = SymPoint(sym);
    double slDist  = MathAbs(entryPrice - slPrice) / point;
-   double tpDist  = MathAbs(entryPrice - tpPrice) / point;
+   double tpDist  = (tpPrice > 0) ? MathAbs(entryPrice - tpPrice) / point : 999999;
    if(stopsLevel > 0 && (slDist < stopsLevel || tpDist < stopsLevel))
    {
       LogWarn(StringFormat("%s Trade blocked: SL/TP too close (stops level=%d, SL=%.0f, TP=%.0f)",
@@ -1474,10 +1506,9 @@ bool PreTradeChecks(string sym, double lots, double entryPrice, double slPrice, 
    double bid = SymbolInfoDouble(sym, SYMBOL_BID);
    double priceDist = MathMin(MathAbs(ask - entryPrice), MathAbs(bid - entryPrice)) / point;
    // Only applies to pending orders that are too close to current price
-   if(freezeLevel > 0 && priceDist < freezeLevel && EntryMode != ENTRY_MARKET)
+   if(freezeLevel > 0 && priceDist < freezeLevel && EntryMode == ENTRY_PENDING)
    {
       LogDebug(StringFormat("%s Pending order too close to price (freeze level=%d)", sym, freezeLevel));
-      // Don't block — the market will move. Just log it.
    }
 
    // 9. Broker trade permission
@@ -1505,13 +1536,19 @@ bool PreTradeChecks(string sym, double lots, double entryPrice, double slPrice, 
 //║                    ENTRY MANAGEMENT                              ║
 //╚═══════════════════════════════════════════════════════════════════╝
 
-// Calculate SL price based on OB zone
+// Calculate SL price based on POI and OB bounds
 double CalculateSL(SSymbolState &st, double pointVal)
 {
+   double refHigh = (st.poiHigh > 0) ? st.poiHigh : (st.obHigh > 0 ? st.obHigh : st.fvgHigh);
+   double refLow  = (st.poiLow > 0)  ? st.poiLow  : (st.obLow > 0  ? st.obLow  : st.fvgLow);
+
+   if(st.obValid && st.obHigh > refHigh) refHigh = st.obHigh;
+   if(st.obValid && st.obLow < refLow && st.obLow > 0) refLow = st.obLow;
+
    if(st.bias == DIR_BEARISH)
-      return st.obHigh + SLBufferPoints * pointVal;
+      return refHigh + SLBufferPoints * pointVal;
    else
-      return st.obLow - SLBufferPoints * pointVal;
+      return refLow - SLBufferPoints * pointVal;
 }
 
 // Calculate TP price based on mode
@@ -1539,10 +1576,8 @@ double CalculateTP(SSymbolState &st, double entryPrice, double slPrice, double p
 
       case TP_LIQUIDITY:
       {
-         // Target the nearest opposing liquidity level
          double target = FindLiquidityTarget(st, entryPrice, pointVal);
          if(target > 0) return target;
-         // Fallback to RR if no liquidity target found
          if(st.bias == DIR_BEARISH)
             return entryPrice - slDist * RiskRewardRatio;
          else
@@ -1555,11 +1590,10 @@ double CalculateTP(SSymbolState &st, double entryPrice, double slPrice, double p
          double rrTarget  = (st.bias == DIR_BEARISH) ?
                             entryPrice - slDist * RiskRewardRatio :
                             entryPrice + slDist * RiskRewardRatio;
-         // Use whichever is closer to entry (more conservative)
          if(liqTarget > 0)
          {
             if(st.bias == DIR_BEARISH)
-               return MathMax(liqTarget, rrTarget); // Closer = higher for bearish
+               return MathMax(liqTarget, rrTarget);
             else
                return MathMin(liqTarget, rrTarget);
          }
@@ -1577,7 +1611,6 @@ double FindLiquidityTarget(SSymbolState &st, double entryPrice, double pointVal)
 
    if(st.bias == DIR_BEARISH)
    {
-      // Look for sell-side liquidity BELOW entry
       for(int i = 0; i < st.sellSideLiqCount; i++)
       {
          if(st.sellSideLiq[i].price < entryPrice)
@@ -1593,7 +1626,6 @@ double FindLiquidityTarget(SSymbolState &st, double entryPrice, double pointVal)
    }
    else
    {
-      // Look for buy-side liquidity ABOVE entry
       for(int i = 0; i < st.buySideLiqCount; i++)
       {
          if(st.buySideLiq[i].price > entryPrice)
@@ -1632,10 +1664,8 @@ void BuildEntryPlan(SSymbolState &st, double pointVal)
       {
          double ratio = (double)i / (double)(entries - 1); // 0.0 to 1.0
          if(st.bias == DIR_BEARISH)
-            // Bearish: entries from high (top of POI) to low
             st.entryPrices[i] = NormalizeDouble(st.poiHigh - ratio * poiRange, digits);
          else
-            // Bullish: entries from low (bottom of POI) to high
             st.entryPrices[i] = NormalizeDouble(st.poiLow + ratio * poiRange, digits);
       }
    }
@@ -1652,15 +1682,13 @@ void BuildEntryPlan(SSymbolState &st, double pointVal)
    {
       double lots = CalculateLotSize(st.symbol, perEntryRisk, st.entryPrices[i], st.slPrice);
 
-      // Apply volume distribution weighting
       if(VolumeDist == VOL_WEIGHTED && entries > 1)
       {
-         // Weight more volume near the OB end
          double weight;
          if(st.bias == DIR_BEARISH)
-            weight = 1.0 + (double)i / (double)(entries - 1); // Higher weight at top
+            weight = 1.0 + (double)i / (double)(entries - 1);
          else
-            weight = 1.0 + (1.0 - (double)i / (double)(entries - 1)); // Higher weight at bottom
+            weight = 1.0 + (1.0 - (double)i / (double)(entries - 1));
          lots = NormalizeLots(st.symbol, lots * weight / 1.5);
       }
 
@@ -1678,12 +1706,27 @@ bool PlacePendingOrders(SSymbolState &st, double pointVal)
    st.orderTicketCount = 0;
    bool anyPlaced = false;
 
+   double curAsk = SymbolInfoDouble(st.symbol, SYMBOL_ASK);
+   double curBid = SymbolInfoDouble(st.symbol, SYMBOL_BID);
+
    for(int i = 0; i < st.numPlannedEntries; i++)
    {
       double entryPrice = st.entryPrices[i];
       double lots       = st.entryLots[i];
 
       if(lots <= 0) continue;
+
+      if(st.bias == DIR_BEARISH && entryPrice <= curAsk)
+      {
+         LogDebug(StringFormat("%s SellLimit price %.5f <= Ask %.5f, skipping pending order #%d", st.symbol, entryPrice, curAsk, i + 1));
+         continue;
+      }
+      if(st.bias == DIR_BULLISH && entryPrice >= curBid)
+      {
+         LogDebug(StringFormat("%s BuyLimit price %.5f >= Bid %.5f, skipping pending order #%d", st.symbol, entryPrice, curBid, i + 1));
+         continue;
+      }
+
       if(!PreTradeChecks(st.symbol, lots, entryPrice, st.slPrice, st.tpPrice)) continue;
 
       string comment = StringFormat("%s_%s_%d", EAComment, DirectionToString(st.bias), i + 1);
@@ -1718,38 +1761,81 @@ bool PlacePendingOrders(SSymbolState &st, double pointVal)
                                st.symbol, g_trade.ResultRetcode(), g_trade.ResultComment()));
       }
    }
+
+   if(anyPlaced)
+   {
+      string setupId = GenerateSetupId(st);
+      MarkSetupProcessed(st, setupId);
+   }
+
    return anyPlaced;
 }
 
-// Execute a market entry
+// Execute a market entry with strictly valid SL/TP
 bool ExecuteMarketEntry(SSymbolState &st, double pointVal)
 {
    g_trade.SetExpertMagicNumber(st.magicNumber);
    g_trade.SetDeviationInPoints(Slippage);
    g_trade.SetTypeFilling(GetFillType(st.symbol));
 
-   double lots = CalculateLotSize(st.symbol, RiskPercentPerSetup, st.entryPrices[0], st.slPrice);
-   if(lots <= 0) return false;
-   if(!PreTradeChecks(st.symbol, lots, st.entryPrices[0], st.slPrice, st.tpPrice)) return false;
+   int digits = SymDigits(st.symbol);
+   int stopsLevel = (int)SymbolInfoInteger(st.symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = (stopsLevel + 5) * pointVal;
+
+   double entryPrice = (st.bias == DIR_BEARISH) ? SymbolInfoDouble(st.symbol, SYMBOL_BID) : SymbolInfoDouble(st.symbol, SYMBOL_ASK);
+   if(entryPrice <= 0) return false;
+
+   // Ensure SL is strictly valid for market entry
+   double slPrice = st.slPrice;
+   if(st.bias == DIR_BEARISH)
+   {
+      if(slPrice <= entryPrice + minDist)
+         slPrice = entryPrice + MathMax(minDist, (st.currentATR_LTF > 0 ? st.currentATR_LTF : 50 * pointVal));
+   }
+   else
+   {
+      if(slPrice >= entryPrice - minDist || slPrice <= 0)
+         slPrice = entryPrice - MathMax(minDist, (st.currentATR_LTF > 0 ? st.currentATR_LTF : 50 * pointVal));
+   }
+   slPrice = NormalizeDouble(slPrice, digits);
+
+   // Calculate TP strictly relative to actual entryPrice and RR
+   double slDist = MathAbs(entryPrice - slPrice);
+   double tpPrice = 0;
+   if(st.bias == DIR_BEARISH)
+      tpPrice = entryPrice - slDist * RiskRewardRatio;
+   else
+      tpPrice = entryPrice + slDist * RiskRewardRatio;
+   tpPrice = NormalizeDouble(tpPrice, digits);
+
+   // Update state SL/TP
+   st.slPrice = slPrice;
+   st.tpPrice = tpPrice;
+
+   double lots = CalculateLotSize(st.symbol, RiskPercentPerSetup, entryPrice, slPrice);
+   if(lots <= 0) lots = SymbolInfoDouble(st.symbol, SYMBOL_VOLUME_MIN);
+
+   if(!PreTradeChecks(st.symbol, lots, entryPrice, slPrice, tpPrice))
+   {
+      LogWarn(StringFormat("%s PreTradeChecks blocked Market Entry (price=%.5f SL=%.5f TP=%.5f lots=%.4f)",
+                           st.symbol, entryPrice, slPrice, tpPrice, lots));
+      return false;
+   }
 
    string comment = StringFormat("%s_%s_MKT", EAComment, DirectionToString(st.bias));
    bool result = false;
 
    if(st.bias == DIR_BEARISH)
-   {
-      double bid = SymbolInfoDouble(st.symbol, SYMBOL_BID);
-      result = g_trade.Sell(lots, st.symbol, bid, st.slPrice, st.tpPrice, comment);
-   }
+      result = g_trade.Sell(lots, st.symbol, entryPrice, slPrice, tpPrice, comment);
    else
-   {
-      double ask = SymbolInfoDouble(st.symbol, SYMBOL_ASK);
-      result = g_trade.Buy(lots, st.symbol, ask, st.slPrice, st.tpPrice, comment);
-   }
+      result = g_trade.Buy(lots, st.symbol, entryPrice, slPrice, tpPrice, comment);
 
    if(result)
    {
-      LogInfo(StringFormat("%s Market %s executed: lots=%.4f SL=%.5f TP=%.5f",
-                           st.symbol, DirectionToString(st.bias), lots, st.slPrice, st.tpPrice));
+      string setupId = GenerateSetupId(st);
+      MarkSetupProcessed(st, setupId);
+      LogInfo(StringFormat("%s Market %s executed: lots=%.4f price=%.5f SL=%.5f TP=%.5f",
+                           st.symbol, DirectionToString(st.bias), lots, entryPrice, slPrice, tpPrice));
       return true;
    }
    else
@@ -1758,6 +1844,49 @@ bool ExecuteMarketEntry(SSymbolState &st, double pointVal)
                             st.symbol, g_trade.ResultRetcode(), g_trade.ResultComment()));
       return false;
    }
+}
+
+// Execute a hybrid entry: Market entry + Grid Limit orders inside the POI
+bool ExecuteHybridEntry(SSymbolState &st, double pointVal)
+{
+   // 1. Execute immediate market entry so the trade is never missed
+   bool mktOk = ExecuteMarketEntry(st, pointVal);
+   if(!mktOk) return false;
+
+   // 2. If NumberOfEntries > 1, place additional Limit orders inside POI as grid re-entries
+   if(st.numPlannedEntries > 1)
+   {
+      double curAsk = SymbolInfoDouble(st.symbol, SYMBOL_ASK);
+      double curBid = SymbolInfoDouble(st.symbol, SYMBOL_BID);
+
+      for(int i = 1; i < st.numPlannedEntries; i++)
+      {
+         double entryPrice = st.entryPrices[i];
+         double lots       = st.entryLots[i];
+         if(lots <= 0) continue;
+
+         bool valid = (st.bias == DIR_BEARISH) ? (entryPrice > curAsk) : (entryPrice < curBid);
+         if(!valid) continue;
+
+         if(!PreTradeChecks(st.symbol, lots, entryPrice, st.slPrice, st.tpPrice)) continue;
+
+         string comment = StringFormat("%s_%s_G%d", EAComment, DirectionToString(st.bias), i + 1);
+         bool res = false;
+         if(st.bias == DIR_BEARISH)
+            res = g_trade.SellLimit(lots, entryPrice, st.symbol, st.slPrice, st.tpPrice, ORDER_TIME_GTC, 0, comment);
+         else
+            res = g_trade.BuyLimit(lots, entryPrice, st.symbol, st.slPrice, st.tpPrice, ORDER_TIME_GTC, 0, comment);
+
+         if(res)
+         {
+            ulong tkt = g_trade.ResultOrder();
+            if(tkt > 0 && st.orderTicketCount < MAX_ENTRIES)
+               st.orderTickets[st.orderTicketCount++] = tkt;
+            LogInfo(StringFormat("%s Grid Limit #%d placed: price=%.5f lots=%.4f", st.symbol, i + 1, entryPrice, lots));
+         }
+      }
+   }
+   return true;
 }
 
 // Delete all pending orders for this symbol/magic
@@ -2482,7 +2611,12 @@ void ProcessSymbol(int si)
          //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_CHOCH:
          {
-            if(!newLTFBar || ltfCount < LTFSwingStrength * 2 + 5) break;
+            if(!newLTFBar || ltfCount < LTFSwingStrength * 2 + 5)
+            {
+               if(!newLTFBar)
+                  LogDebug(StringFormat("%s WAIT_CHOCH: skipped (not new LTF bar)", sym));
+               break;
+            }
 
             // Check expiry
             int age = BarsElapsed(sym, LTF_Timeframe, g_states[si].setupStartTime);
@@ -2499,6 +2633,17 @@ void ProcessSymbol(int si)
                          g_states[si].ltfSwingHighs, g_states[si].ltfSwingHighCount,
                          g_states[si].ltfSwingLows,  g_states[si].ltfSwingLowCount,
                          point, MAX_SWINGS);
+
+            // DIAGNOSTIC: Log bar values being compared for CHoCH
+            if(ltfCount >= 5)
+            {
+               LogInfo(StringFormat("%s CHOCH_CHECK: bias=%s bar1[L=%.3f C=%.3f O=%.3f] bar2[L=%.3f] bar3[L=%.3f] bar4[L=%.3f] ATR=%.3f swHL=%d swLL=%d",
+                  sym, DirectionToString(g_states[si].bias),
+                  ltfRates[1].low, ltfRates[1].close, ltfRates[1].open,
+                  ltfRates[2].low, ltfRates[3].low, ltfRates[4].low,
+                  g_states[si].currentATR_LTF,
+                  g_states[si].ltfSwingHighCount, g_states[si].ltfSwingLowCount));
+            }
 
             // Check for CHoCH
             if(DetectCHoCH(g_states[si], ltfRates, ltfCount, point))
@@ -2578,27 +2723,20 @@ void ProcessSymbol(int si)
 
             if(DetectOrderBlock(g_states[si], ltfRates, ltfCount, point))
             {
-               // Validate OB age
                int obAge = BarsElapsed(sym, LTF_Timeframe, g_states[si].obTime);
                if(obAge <= OBMaxAgeBars)
                {
                   DrawOrderBlock(g_states[si]);
-                  g_states[si].currentState = STATE_IDENTIFYING_FVG;
-                  stateChanged = true;
                }
                else
                {
                   LogWarn(StringFormat("%s OB too old (%d bars > %d max)", sym, obAge, OBMaxAgeBars));
                   g_states[si].obValid = false;
-                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
-                  stateChanged = true;
                }
             }
-            else
-            {
-               g_states[si].currentState = STATE_SETUP_INVALIDATED;
-               stateChanged = true;
-            }
+            // Always proceed to check FVG so either OB or FVG can form the POI
+            g_states[si].currentState = STATE_IDENTIFYING_FVG;
+            stateChanged = true;
             break;
          }
 
@@ -2624,6 +2762,8 @@ void ProcessSymbol(int si)
             }
             else
             {
+               LogInfo(StringFormat("%s CONFLUENCE_FAILED: obValid=%d fvgValid=%d",
+                  sym, (int)g_states[si].obValid, (int)g_states[si].fvgValid));
                g_states[si].currentState = STATE_SETUP_INVALIDATED;
                stateChanged = true;
             }
@@ -2645,7 +2785,6 @@ void ProcessSymbol(int si)
                stateChanged = true;
                break;
             }
-            MarkSetupProcessed(g_states[si], setupId);
 
             LogInfo(StringFormat("%s Setup confirmed: %s POI=%.5f-%.5f SL=%.5f TP=%.5f",
                                  sym, DirectionToString(g_states[si].bias),
@@ -2677,11 +2816,14 @@ void ProcessSymbol(int si)
             double invalidationDist = g_states[si].currentATR_LTF * 2.0;
             if(invalidationDist <= 0) invalidationDist = SLBufferPoints * point * 10; // fallback
 
+            double maxBoundHigh = (g_states[si].obValid && g_states[si].obHigh > g_states[si].poiHigh) ? g_states[si].obHigh : g_states[si].poiHigh;
+            double minBoundLow  = (g_states[si].obValid && g_states[si].obLow < g_states[si].poiLow && g_states[si].obLow > 0) ? g_states[si].obLow : g_states[si].poiLow;
+
             if(g_states[si].bias == DIR_BEARISH)
             {
-               if(ask > g_states[si].obHigh + invalidationDist)
+               if(maxBoundHigh > 0 && ask > maxBoundHigh + invalidationDist)
                {
-                  LogInfo(StringFormat("%s POI invalidated: price above OB by %.5f", sym, ask - g_states[si].obHigh));
+                  LogInfo(StringFormat("%s POI invalidated: price above POI by %.5f", sym, ask - maxBoundHigh));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                   break;
@@ -2689,9 +2831,9 @@ void ProcessSymbol(int si)
             }
             else
             {
-               if(bid < g_states[si].obLow - invalidationDist)
+               if(minBoundLow > 0 && bid < minBoundLow - invalidationDist)
                {
-                  LogInfo(StringFormat("%s POI invalidated: price below OB by %.5f", sym, g_states[si].obLow - bid));
+                  LogInfo(StringFormat("%s POI invalidated: price below POI by %.5f", sym, minBoundLow - bid));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                   break;
@@ -2699,7 +2841,7 @@ void ProcessSymbol(int si)
             }
 
             // Entry logic based on mode
-            if(EntryMode == ENTRY_PENDING || EntryMode == ENTRY_HYBRID)
+            if(EntryMode == ENTRY_PENDING)
             {
                DrawEntryLevels(g_states[si]);
                if(PlacePendingOrders(g_states[si], point))
@@ -2710,6 +2852,20 @@ void ProcessSymbol(int si)
                else
                {
                   LogWarn(StringFormat("%s Failed to place pending orders", sym));
+                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                  stateChanged = true;
+               }
+            }
+            else if(EntryMode == ENTRY_HYBRID)
+            {
+               DrawEntryLevels(g_states[si]);
+               if(ExecuteHybridEntry(g_states[si], point))
+               {
+                  g_states[si].currentState = STATE_POSITION_ACTIVE;
+                  stateChanged = true;
+               }
+               else
+               {
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                }
