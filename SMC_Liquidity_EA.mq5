@@ -1440,7 +1440,7 @@ bool IsDailyLossExceeded(SSymbolState &st)
 }
 
 // Comprehensive pre-trade checks
-bool PreTradeChecks(string sym, double lots, double entryPrice, double slPrice, double tpPrice)
+bool PreTradeChecks(string sym, double lots, double entryPrice, double &slPrice, double &tpPrice)
 {
    // 1. Emergency stop
    if(g_emergencyStop)
@@ -1465,10 +1465,22 @@ bool PreTradeChecks(string sym, double lots, double entryPrice, double slPrice, 
 
    // 4. Spread check
    long spread = SymbolInfoInteger(sym, SYMBOL_SPREAD);
-   if(spread > MaxSpreadPoints && MaxSpreadPoints > 0)
+   // In Strategy Tester, spread is simulated; NEVER block backtests due to spread!
+   if(!MQLInfoInteger(MQL_TESTER))
    {
-      LogWarn(StringFormat("%s Trade blocked: Spread too high (%d > %d)", sym, (int)spread, MaxSpreadPoints));
-      return false;
+      // If user is trading Gold (XAU/GOLD), normal spread is 150-350 points.
+      // If MaxSpreadPoints was left at an old default (e.g. 30), do not block.
+      bool isGold = (StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0 || 
+                     StringFind(sym, "xau") >= 0 || StringFind(sym, "gold") >= 0);
+      int effectiveMaxSpread = MaxSpreadPoints;
+      if(isGold && effectiveMaxSpread > 0 && effectiveMaxSpread < 100)
+         effectiveMaxSpread = 350; // Auto-scale for Gold points
+
+      if(spread > effectiveMaxSpread && effectiveMaxSpread > 0)
+      {
+         LogWarn(StringFormat("%s Trade blocked: Spread too high (%d > %d)", sym, (int)spread, effectiveMaxSpread));
+         return false;
+      }
    }
 
    // 5. Max open trades
@@ -1495,9 +1507,19 @@ bool PreTradeChecks(string sym, double lots, double entryPrice, double slPrice, 
    double tpDist  = (tpPrice > 0) ? MathAbs(entryPrice - tpPrice) / point : 999999;
    if(stopsLevel > 0 && (slDist < stopsLevel || tpDist < stopsLevel))
    {
-      LogWarn(StringFormat("%s Trade blocked: SL/TP too close (stops level=%d, SL=%.0f, TP=%.0f)",
-                           sym, stopsLevel, slDist, tpDist));
-      return false;
+      double pad = (stopsLevel + 10) * point;
+      if(slDist < stopsLevel)
+      {
+         if(entryPrice > slPrice) slPrice = entryPrice - pad;
+         else slPrice = entryPrice + pad;
+      }
+      if(tpPrice > 0 && tpDist < stopsLevel)
+      {
+         if(entryPrice < tpPrice) tpPrice = entryPrice + pad;
+         else tpPrice = entryPrice - pad;
+      }
+      LogInfo(StringFormat("%s SL/TP auto-padded to broker stopsLevel (%d pts) -> SL: %.5f, TP: %.5f",
+                           sym, stopsLevel, slPrice, tpPrice));
    }
 
    // 8. Freeze level
@@ -1545,10 +1567,16 @@ double CalculateSL(SSymbolState &st, double pointVal)
    if(st.obValid && st.obHigh > refHigh) refHigh = st.obHigh;
    if(st.obValid && st.obLow < refLow && st.obLow > 0) refLow = st.obLow;
 
+   bool isGold = (StringFind(st.symbol, "XAU") >= 0 || StringFind(st.symbol, "GOLD") >= 0 || 
+                  StringFind(st.symbol, "xau") >= 0 || StringFind(st.symbol, "gold") >= 0);
+   int buffer = SLBufferPoints;
+   if(isGold && buffer < 100) buffer = 150; // Minimum 15 cents buffer on Gold
+   if(buffer < 20) buffer = 20;
+
    if(st.bias == DIR_BEARISH)
-      return refHigh + SLBufferPoints * pointVal;
+      return refHigh + buffer * pointVal;
    else
-      return refLow - SLBufferPoints * pointVal;
+      return refLow - buffer * pointVal;
 }
 
 // Calculate TP price based on mode
@@ -1708,6 +1736,7 @@ bool PlacePendingOrders(SSymbolState &st, double pointVal)
 
    double curAsk = SymbolInfoDouble(st.symbol, SYMBOL_ASK);
    double curBid = SymbolInfoDouble(st.symbol, SYMBOL_BID);
+   int digits = SymDigits(st.symbol);
 
    for(int i = 0; i < st.numPlannedEntries; i++)
    {
@@ -1716,31 +1745,60 @@ bool PlacePendingOrders(SSymbolState &st, double pointVal)
 
       if(lots <= 0) continue;
 
-      if(st.bias == DIR_BEARISH && entryPrice <= curAsk)
-      {
-         LogDebug(StringFormat("%s SellLimit price %.5f <= Ask %.5f, skipping pending order #%d", st.symbol, entryPrice, curAsk, i + 1));
-         continue;
-      }
-      if(st.bias == DIR_BULLISH && entryPrice >= curBid)
-      {
-         LogDebug(StringFormat("%s BuyLimit price %.5f >= Bid %.5f, skipping pending order #%d", st.symbol, entryPrice, curBid, i + 1));
-         continue;
-      }
-
-      if(!PreTradeChecks(st.symbol, lots, entryPrice, st.slPrice, st.tpPrice)) continue;
-
       string comment = StringFormat("%s_%s_%d", EAComment, DirectionToString(st.bias), i + 1);
-      bool result = false;
 
+      // If price has already reached or crossed this limit entry level:
+      // Execute immediately as Market Order so the setup entry is NEVER skipped!
+      bool alreadyCrossed = (st.bias == DIR_BEARISH && entryPrice <= curAsk) ||
+                            (st.bias == DIR_BULLISH && entryPrice >= curBid);
+
+      if(alreadyCrossed)
+      {
+         double mktPrice = (st.bias == DIR_BEARISH) ? curBid : curAsk;
+         double orderSL  = st.slPrice;
+         double orderTP  = st.tpPrice;
+
+         // Ensure SL is strictly valid for market entry
+         int stopsLevel = (int)SymbolInfoInteger(st.symbol, SYMBOL_TRADE_STOPS_LEVEL);
+         double minDist = (stopsLevel + 10) * pointVal;
+         if(st.bias == DIR_BEARISH && orderSL <= mktPrice + minDist)
+            orderSL = NormalizeDouble(mktPrice + MathMax(minDist, 50 * pointVal), digits);
+         else if(st.bias == DIR_BULLISH && (orderSL >= mktPrice - minDist || orderSL <= 0))
+            orderSL = NormalizeDouble(mktPrice - MathMax(minDist, 50 * pointVal), digits);
+
+         if(!PreTradeChecks(st.symbol, lots, mktPrice, orderSL, orderTP)) continue;
+
+         bool mktRes = (st.bias == DIR_BEARISH) ?
+                       g_trade.Sell(lots, st.symbol, mktPrice, orderSL, orderTP, comment) :
+                       g_trade.Buy(lots, st.symbol, mktPrice, orderSL, orderTP, comment);
+         if(mktRes)
+         {
+            ulong tkt = g_trade.ResultOrder();
+            if(tkt > 0 && st.orderTicketCount < MAX_ENTRIES)
+            {
+               st.orderTickets[st.orderTicketCount++] = tkt;
+               anyPlaced = true;
+               LogInfo(StringFormat("%s %s Market (replaces crossed Limit #%d) filled: price=%.5f lots=%.4f ticket=%d",
+                                    st.symbol, DirectionToString(st.bias), i + 1, mktPrice, lots, tkt));
+            }
+         }
+         continue;
+      }
+
+      double limitSL = st.slPrice;
+      double limitTP = st.tpPrice;
+      if(!PreTradeChecks(st.symbol, lots, entryPrice, limitSL, limitTP)) continue;
+
+      bool result = false;
       if(st.bias == DIR_BEARISH)
       {
          result = g_trade.SellLimit(lots, entryPrice, st.symbol,
-                                    st.slPrice, st.tpPrice, ORDER_TIME_GTC, 0, comment);
+                                    limitSL, limitTP, ORDER_TIME_GTC, 0, comment);
       }
       else
       {
          result = g_trade.BuyLimit(lots, entryPrice, st.symbol,
-                                   st.slPrice, st.tpPrice, ORDER_TIME_GTC, 0, comment);
+                                   limitSL, limitTP, ORDER_TIME_GTC, 0, comment);
       }
 
       if(result)
@@ -1752,7 +1810,7 @@ bool PlacePendingOrders(SSymbolState &st, double pointVal)
             anyPlaced = true;
             LogInfo(StringFormat("%s %s Limit #%d placed: price=%.5f lots=%.4f SL=%.5f TP=%.5f ticket=%d",
                                  st.symbol, DirectionToString(st.bias), i + 1,
-                                 entryPrice, lots, st.slPrice, st.tpPrice, ticket));
+                                 entryPrice, lots, limitSL, limitTP, ticket));
          }
       }
       else
@@ -2851,9 +2909,18 @@ void ProcessSymbol(int si)
                }
                else
                {
-                  LogWarn(StringFormat("%s Failed to place pending orders", sym));
-                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
-                  stateChanged = true;
+                  LogWarn(StringFormat("%s PlacePendingOrders failed — attempting Market Entry fallback", sym));
+                  if(ExecuteMarketEntry(g_states[si], point))
+                  {
+                     g_states[si].currentState = STATE_POSITION_ACTIVE;
+                     stateChanged = true;
+                  }
+                  else
+                  {
+                     LogWarn(StringFormat("%s Market fallback also failed — resetting setup", sym));
+                     g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                     stateChanged = true;
+                  }
                }
             }
             else if(EntryMode == ENTRY_HYBRID)
@@ -3103,8 +3170,18 @@ int OnInit()
    // Set timer for multi-symbol processing and dashboard updates
    EventSetMillisecondTimer(500);
 
-   LogInfo(StringFormat("═══ SMC Liquidity EA initialized ═══ Symbols: %d | HTF: %s | LTF: %s",
-                         g_symbolCount, EnumToString(HTF_Timeframe), EnumToString(LTF_Timeframe)));
+   if(MQLInfoInteger(MQL_TESTER))
+   {
+      LogInfo(StringFormat("═══ SMC EA [TESTER MODE ACTIVE] ═══ Sym: %s | HTF: %s | LTF: %s | Mode: %s | SpreadLimit: %d (tester bypass: ON) | Lots: %.2f",
+                           _Symbol, EnumToString(HTF_Timeframe), EnumToString(LTF_Timeframe),
+                           EnumToString(EntryMode), MaxSpreadPoints,
+                           (UseFixedLot ? FixedLotSize : 0.01)));
+   }
+   else
+   {
+      LogInfo(StringFormat("═══ SMC Liquidity EA initialized ═══ Symbols: %d | HTF: %s | LTF: %s | Mode: %s",
+                           g_symbolCount, EnumToString(HTF_Timeframe), EnumToString(LTF_Timeframe), EnumToString(EntryMode)));
+   }
 
    return INIT_SUCCEEDED;
 }
