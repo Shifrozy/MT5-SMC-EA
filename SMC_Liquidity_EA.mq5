@@ -30,21 +30,36 @@
 
 enum ENUM_SETUP_STATE
 {
-   STATE_WAITING_FOR_LIQUIDITY,   // Waiting For Liquidity
-   STATE_LIQUIDITY_SWEPT,         // Liquidity Swept
-   STATE_WAITING_FOR_CHOCH,       // Waiting For CHoCH
-   STATE_CHOCH_CONFIRMED,         // CHoCH Confirmed
+   STATE_WAITING_FOR_LIQUIDITY,   // Waiting For Liquidity (PDH/PDL or Swings)
+   STATE_LIQUIDITY_SWEPT,         // Liquidity Swept + Rejected
+   STATE_WAITING_FOR_CHOCH,       // Waiting For 15M Displacement / CHoCH
+   STATE_CHOCH_CONFIRMED,         // Displacement / CHoCH Confirmed
    STATE_WAITING_FOR_BOS,         // Waiting For BOS
    STATE_BOS_CONFIRMED,           // BOS Confirmed
    STATE_IDENTIFYING_OB,          // Identifying Order Block
    STATE_IDENTIFYING_FVG,         // Identifying FVG
-   STATE_CONFLUENCE_CONFIRMED,    // Confluence Confirmed
-   STATE_WAITING_FOR_RETEST,      // Waiting For Retest
+   STATE_CONFLUENCE_CONFIRMED,    // Confluence Confirmed (15M POI established)
+   STATE_WAITING_FOR_RETEST,      // Waiting For POI Retest
+   STATE_WAITING_FOR_LTF_CONFIRM, // Waiting For 1M/3M/5M Confirmation
    STATE_ORDERS_PLACED,           // Orders Placed
    STATE_POSITION_ACTIVE,         // Position Active
    STATE_TARGET_REACHED,          // Target Reached
    STATE_SETUP_INVALIDATED,       // Setup Invalidated
    STATE_RESET                    // Reset
+};
+
+enum ENUM_LIQUIDITY_SOURCE
+{
+   LIQ_PREVIOUS_DAY_HL,    // Previous Day High/Low (PDH / PDL - Default)
+   LIQ_SWING_HIGHS_LOWS,   // HTF Swing Highs & Lows
+   LIQ_BOTH                // Both PDH/PDL and HTF Swings
+};
+
+enum ENUM_LTF_CONFIRMATION
+{
+   CONFIRM_LTF_REJECTION,       // POI Rejection Candle (Wick/Engulfing)
+   CONFIRM_LTF_CHOCH,           // Micro CHoCH / Market Structure Shift
+   CONFIRM_LTF_ANY              // Any (Rejection Candle or Micro CHoCH)
 };
 
 enum ENUM_DIRECTION
@@ -123,6 +138,7 @@ struct SSymbolState
    ENUM_DIRECTION    bias;
 
    // Timing
+   datetime          d1LastBarTime;
    datetime          htfLastBarTime;
    datetime          ltfLastBarTime;
 
@@ -130,6 +146,28 @@ struct SSymbolState
    int               atrHandleLTF;
    int               atrHandleHTF;
    double            currentATR_LTF;
+   double            currentATR_HTF;
+
+   // Previous Day High & Low (External Liquidity - Rules 1, 2, 3)
+   double            pdhPrice;         // Previous Day High (Buy-Side Liquidity)
+   double            pdlPrice;         // Previous Day Low (Sell-Side Liquidity)
+   datetime          pdhTime;          // Time of completed D1 candle
+   datetime          pdlTime;
+   bool              pdhSwept;         // Has PDH been swept
+   bool              pdlSwept;         // Has PDL been swept
+   datetime          pdhSweepTime;
+   datetime          pdlSweepTime;
+   bool              pdhConsumed;      // Marked consumed if trade hits SL (Rule 7)
+   bool              pdlConsumed;      // Marked consumed if trade hits SL (Rule 7)
+
+   // Anti-Re-Entry After Stop Loss (Rule 7)
+   datetime          lastFailedSweepTime;
+   double            lastFailedSweepPrice;
+   ENUM_DIRECTION    lastFailedBias;
+
+   // POI Retest Tracking (Rule 5)
+   bool              poiRetested;
+   datetime          poiRetestTime;
 
    // HTF Swing Data
    SSwingPoint       htfSwingHighs[MAX_SWINGS];
@@ -149,23 +187,24 @@ struct SSymbolState
    SSwingPoint       ltfSwingLows[MAX_SWINGS];
    int               ltfSwingLowCount;
 
-   // Active Setup — Sweep
+   // Active Setup — Sweep (Rules 2, 3)
    double            liquidityLevel;
    double            sweepPrice;
    datetime          sweepTime;
+   int               sweepBar;
+   bool              isPDHSweep;
+   bool              isPDLSweep;
 
-   // Active Setup — CHoCH
+   // Active Setup — 15M Displacement & Structure (Rule 4)
    double            chochLevel;
    int               chochBar;
    datetime          chochTime;
-
-   // Active Setup — BOS
    double            bosLevel;
    int               bosBar;
    datetime          bosTime;
-
-   // Active Setup — displacement reference bar
    int               displacementBar;
+   datetime          displacementTime;
+   double            displacementSize;
 
    // Active Setup — Order Block
    double            obHigh;
@@ -226,9 +265,25 @@ input group "══════ General ══════"
 input long            MagicNumber              = 202409;        // Magic Number
 input string          EAComment                = "SMC_LIQ";     // Order Comment
 
-input group "══════ Timeframes ══════"
-input ENUM_TIMEFRAMES HTF_Timeframe            = PERIOD_H1;     // Higher Timeframe (Liquidity)
-input ENUM_TIMEFRAMES LTF_Timeframe            = PERIOD_M5;     // Lower Timeframe (Execution)
+input group "══════ Timeframes (Client Sequence) ══════"
+input ENUM_TIMEFRAMES Setup_Timeframe          = PERIOD_M15;    // Setup Timeframe (15M Sweep, Displacement, POI)
+input ENUM_TIMEFRAMES Entry_Timeframe          = PERIOD_M5;     // Entry Timeframe (1M, 3M, 5M Confirmation)
+
+#define HTF_Timeframe Setup_Timeframe
+#define LTF_Timeframe Entry_Timeframe
+
+input group "══════ Liquidity Source (PDH / PDL) ══════"
+input ENUM_LIQUIDITY_SOURCE LiquiditySource    = LIQ_PREVIOUS_DAY_HL; // Liquidity Source (PDH/PDL or Swings)
+input bool            ShowPDH_PDL_Lines        = true;                // Draw Previous Day High/Low Lines
+input color           ClrPDH                   = clrDodgerBlue;       // PDH (Buy-Side Liquidity) Color
+input color           ClrPDL                   = clrOrangeRed;        // PDL (Sell-Side Liquidity) Color
+
+input group "══════ Lower-Timeframe Entry (1M/3M/5M) ══════"
+input ENUM_LTF_CONFIRMATION LTFConfirmationMethod = CONFIRM_LTF_ANY;  // LTF Confirmation (Rejection/CHoCH/Any)
+input int             MaxRetestWaitBars        = 50;                  // Max 15M Bars To Wait For POI Retest
+
+input group "══════ Re-Entry Protection (Rule 7) ══════"
+input bool            BlockReEntryAfterSL      = true;                // Block Re-Entry on Same Setup After SL
 
 input group "══════ Swing Detection ══════"
 input int             SwingLookback            = 100;           // HTF Bars To Scan
@@ -409,14 +464,15 @@ string StateToString(ENUM_SETUP_STATE s)
    {
       case STATE_WAITING_FOR_LIQUIDITY: return "WAIT_LIQ";
       case STATE_LIQUIDITY_SWEPT:       return "LIQ_SWEPT";
-      case STATE_WAITING_FOR_CHOCH:     return "WAIT_CHOCH";
-      case STATE_CHOCH_CONFIRMED:       return "CHOCH_OK";
+      case STATE_WAITING_FOR_CHOCH:     return "WAIT_15M_DISP";
+      case STATE_CHOCH_CONFIRMED:       return "DISP_OK";
       case STATE_WAITING_FOR_BOS:       return "WAIT_BOS";
       case STATE_BOS_CONFIRMED:         return "BOS_OK";
       case STATE_IDENTIFYING_OB:        return "ID_OB";
       case STATE_IDENTIFYING_FVG:       return "ID_FVG";
-      case STATE_CONFLUENCE_CONFIRMED:  return "CONF_OK";
+      case STATE_CONFLUENCE_CONFIRMED:  return "POI_READY";
       case STATE_WAITING_FOR_RETEST:    return "WAIT_RETEST";
+      case STATE_WAITING_FOR_LTF_CONFIRM: return "WAIT_LTF_CONF";
       case STATE_ORDERS_PLACED:         return "ORDERS";
       case STATE_POSITION_ACTIVE:       return "POS_ACTIVE";
       case STATE_TARGET_REACHED:        return "TARGET";
@@ -580,6 +636,41 @@ int DetectSwings(MqlRates &rates[], int rateCount, int swingStr,
 //║          LIQUIDITY LEVEL DETECTION & SWEEP                       ║
 //╚═══════════════════════════════════════════════════════════════════╝
 
+//--- Forward declarations
+void DrawPreviousDayHLLevels(SSymbolState &st);
+
+//+------------------------------------------------------------------+
+//| Update Previous Day High & Low from completed Daily candle (bar 1)|
+//| Rule 1: High/Low of completed Daily candle = External Liquidity   |
+//+------------------------------------------------------------------+
+void UpdatePreviousDayHL(SSymbolState &st)
+{
+   MqlRates d1Rates[];
+   ArraySetAsSeries(d1Rates, true);
+   // Copy bar 1 on Daily (completed daily candle)
+   if(CopyRates(st.symbol, PERIOD_D1, 1, 2, d1Rates) >= 1)
+   {
+      if(d1Rates[0].time != st.pdhTime)
+      {
+         st.pdhPrice     = d1Rates[0].high;
+         st.pdlPrice     = d1Rates[0].low;
+         st.pdhTime      = d1Rates[0].time;
+         st.pdlTime      = d1Rates[0].time;
+         st.pdhSwept     = false;
+         st.pdlSwept     = false;
+         st.pdhConsumed  = false;
+         st.pdlConsumed  = false;
+         st.lastFailedSweepTime = 0;
+
+         LogInfo(StringFormat("%s [D1 Liquidity Updated] PDH (Buy-Side Liq)=%.5f | PDL (Sell-Side Liq)=%.5f (Date: %s)",
+                              st.symbol, st.pdhPrice, st.pdlPrice, TimeToString(st.pdhTime, TIME_DATE)));
+
+         if(ShowPDH_PDL_Lines && st.symbol == _Symbol)
+            DrawPreviousDayHLLevels(st);
+      }
+   }
+}
+
 // Build liquidity levels from HTF swing points.
 // Buy-side = swing highs + equal highs. Sell-side = swing lows + equal lows.
 void BuildLiquidityLevels(SSymbolState &st, double pointVal)
@@ -646,103 +737,485 @@ void BuildLiquidityLevels(SSymbolState &st, double pointVal)
 }
 
 // Check if any liquidity level has been swept.
-// Returns true if a sweep is detected and populates the state with sweep details.
+// Rules 1, 2, 3: 15M sweep of Previous Day High / Low with rejection.
+// Returns true if a sweep + rejection is detected and populates setup details.
+// IMPORTANT: The sweep itself does NOT trigger an entry!
 bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, double pointVal)
 {
    double sweepBuf = SweepBufferPoints * pointVal;
    double minSweep = MinSweepDistPoints * pointVal;
 
-   // Check buy-side sweeps (→ bearish bias)
-   for(int l = 0; l < st.buySideLiqCount; l++)
+   // 1. Check Previous Day High & Low (External Liquidity - Primary Client Method)
+   if(LiquiditySource == LIQ_PREVIOUS_DAY_HL || LiquiditySource == LIQ_BOTH)
    {
-      if(st.buySideLiq[l].swept) continue;
-      double level = st.buySideLiq[l].price;
-
-      for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
+      // Check Buy-Side Liquidity Sweep (PDH) -> SELL SETUP
+      if(st.pdhPrice > 0)
       {
-         bool swept = false;
-         double penetration = htfRates[b].high - level;
-         if(penetration < sweepBuf) continue; // Not enough penetration
-
-         switch(SweepConfirmationMode)
+         double level = st.pdhPrice;
+         for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
-            case SWEEP_WICK_ONLY:
-               swept = (htfRates[b].high > level + sweepBuf) &&
-                       (htfRates[b].close <= level);
-               break;
-            case SWEEP_CLOSE_BACK:
-               swept = (htfRates[b].high > level + sweepBuf) &&
-                       (b >= 2 && htfRates[b-1].close < level);
-               break;
-            case SWEEP_WICK_AND_CLOSE:
-               swept = (htfRates[b].high > level + sweepBuf) &&
-                       (htfRates[b].close < level);
-               break;
+            if(BlockReEntryAfterSL)
+            {
+               // Skip the exact candle that caused the failed trade
+               if(st.lastFailedSweepTime == htfRates[b].time) continue;
+               // If PDH was already consumed by an SL, require a brand new higher sweep above the failed sweep extreme
+               if(st.pdhConsumed && (st.lastFailedSweepPrice > 0 && htfRates[b].high <= st.lastFailedSweepPrice + minSweep)) continue;
+            }
+
+            double penetration = htfRates[b].high - level;
+            if(penetration < sweepBuf) continue;
+
+            bool sweptAndRejected = false;
+            // Sweep + rejection: wicks above PDH, and closes back below PDH
+            if(htfRates[b].high > level + sweepBuf && htfRates[b].close <= level)
+               sweptAndRejected = true;
+            else if(b >= 2 && htfRates[b].high > level + sweepBuf && htfRates[b - 1].close < level)
+               sweptAndRejected = true;
+
+            if(sweptAndRejected)
+            {
+               st.bias           = DIR_BEARISH;
+               st.liquidityLevel = level;
+               st.sweepPrice     = htfRates[b].high;
+               st.sweepTime      = htfRates[b].time;
+               st.sweepBar       = b;
+               st.isPDHSweep     = true;
+               st.isPDLSweep     = false;
+               st.pdhSwept       = true;
+               st.pdhConsumed    = false; // Reset on valid new sweep
+               st.setupStartTime = TimeCurrent();
+
+               LogInfo(StringFormat("%s [15M PDH SWEEP + REJECTION] Buy-side swept at %.5f (high=%.5f, bar=%d) -> SELL SETUP (Waiting for 15M Displacement)",
+                                    st.symbol, level, htfRates[b].high, b));
+               return true;
+            }
          }
+      }
 
-         if(swept)
+      // Check Sell-Side Liquidity Sweep (PDL) -> BUY SETUP
+      if(st.pdlPrice > 0)
+      {
+         double level = st.pdlPrice;
+         for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
-            st.buySideLiq[l].swept     = true;
-            st.buySideLiq[l].sweepTime = htfRates[b].time;
-            st.buySideLiq[l].sweepPrice= htfRates[b].high;
+            if(BlockReEntryAfterSL)
+            {
+               // Skip the exact candle that caused the failed trade
+               if(st.lastFailedSweepTime == htfRates[b].time) continue;
+               // If PDL was already consumed by an SL, require a brand new lower sweep below the failed sweep extreme
+               if(st.pdlConsumed && (st.lastFailedSweepPrice > 0 && htfRates[b].low >= st.lastFailedSweepPrice - minSweep)) continue;
+            }
 
-            st.bias            = DIR_BEARISH;
-            st.liquidityLevel  = level;
-            st.sweepPrice      = htfRates[b].high;
-            st.sweepTime       = htfRates[b].time;
-            st.setupStartTime  = TimeCurrent();
+            double penetration = level - htfRates[b].low;
+            if(penetration < sweepBuf) continue;
 
-            LogInfo(StringFormat("%s Buy-side liquidity swept at %.5f (high=%.5f)",
-                                st.symbol, level, htfRates[b].high));
-            return true;
+            bool sweptAndRejected = false;
+            // Sweep + rejection: wicks below PDL, and closes back above PDL
+            if(htfRates[b].low < level - sweepBuf && htfRates[b].close >= level)
+               sweptAndRejected = true;
+            else if(b >= 2 && htfRates[b].low < level - sweepBuf && htfRates[b - 1].close > level)
+               sweptAndRejected = true;
+
+            if(sweptAndRejected)
+            {
+               st.bias           = DIR_BULLISH;
+               st.liquidityLevel = level;
+               st.sweepPrice     = htfRates[b].low;
+               st.sweepTime      = htfRates[b].time;
+               st.sweepBar       = b;
+               st.isPDHSweep     = false;
+               st.isPDLSweep     = true;
+               st.pdlSwept       = true;
+               st.pdlConsumed    = false; // Reset on valid new sweep
+               st.setupStartTime = TimeCurrent();
+
+               LogInfo(StringFormat("%s [15M PDL SWEEP + REJECTION] Sell-side swept at %.5f (low=%.5f, bar=%d) -> BUY SETUP (Waiting for 15M Displacement)",
+                                    st.symbol, level, htfRates[b].low, b));
+               return true;
+            }
          }
       }
    }
 
-   // Check sell-side sweeps (→ bullish bias)
-   for(int l = 0; l < st.sellSideLiqCount; l++)
+   // 2. Check Swing Highs / Lows if configured
+   if(LiquiditySource == LIQ_SWING_HIGHS_LOWS || (LiquiditySource == LIQ_BOTH && st.bias == DIR_NONE))
    {
-      if(st.sellSideLiq[l].swept) continue;
-      double level = st.sellSideLiq[l].price;
-
-      for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
+      // Check buy-side sweeps (→ bearish bias)
+      for(int l = 0; l < st.buySideLiqCount; l++)
       {
-         bool swept = false;
-         double penetration = level - htfRates[b].low;
-         if(penetration < sweepBuf) continue;
+         if(st.buySideLiq[l].swept) continue;
+         double level = st.buySideLiq[l].price;
 
-         switch(SweepConfirmationMode)
+         for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
-            case SWEEP_WICK_ONLY:
-               swept = (htfRates[b].low < level - sweepBuf) &&
-                       (htfRates[b].close >= level);
-               break;
-            case SWEEP_CLOSE_BACK:
-               swept = (htfRates[b].low < level - sweepBuf) &&
-                       (b >= 2 && htfRates[b-1].close > level);
-               break;
-            case SWEEP_WICK_AND_CLOSE:
-               swept = (htfRates[b].low < level - sweepBuf) &&
-                       (htfRates[b].close > level);
-               break;
+            if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
+            double penetration = htfRates[b].high - level;
+            if(penetration < sweepBuf) continue;
+
+            bool swept = (htfRates[b].high > level + sweepBuf) && (htfRates[b].close <= level);
+            if(swept)
+            {
+               st.buySideLiq[l].swept     = true;
+               st.buySideLiq[l].sweepTime = htfRates[b].time;
+               st.buySideLiq[l].sweepPrice= htfRates[b].high;
+
+               st.bias            = DIR_BEARISH;
+               st.liquidityLevel  = level;
+               st.sweepPrice      = htfRates[b].high;
+               st.sweepTime       = htfRates[b].time;
+               st.sweepBar        = b;
+               st.isPDHSweep      = false;
+               st.isPDLSweep      = false;
+               st.setupStartTime  = TimeCurrent();
+
+               LogInfo(StringFormat("%s Buy-side swing swept at %.5f (high=%.5f)",
+                                   st.symbol, level, htfRates[b].high));
+               return true;
+            }
          }
+      }
 
-         if(swept)
+      // Check sell-side sweeps (→ bullish bias)
+      for(int l = 0; l < st.sellSideLiqCount; l++)
+      {
+         if(st.sellSideLiq[l].swept) continue;
+         double level = st.sellSideLiq[l].price;
+
+         for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
-            st.sellSideLiq[l].swept     = true;
-            st.sellSideLiq[l].sweepTime = htfRates[b].time;
-            st.sellSideLiq[l].sweepPrice= htfRates[b].low;
+            if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
+            double penetration = level - htfRates[b].low;
+            if(penetration < sweepBuf) continue;
 
-            st.bias            = DIR_BULLISH;
-            st.liquidityLevel  = level;
-            st.sweepPrice      = htfRates[b].low;
-            st.sweepTime       = htfRates[b].time;
-            st.setupStartTime  = TimeCurrent();
+            bool swept = (htfRates[b].low < level - sweepBuf) && (htfRates[b].close >= level);
+            if(swept)
+            {
+               st.sellSideLiq[l].swept     = true;
+               st.sellSideLiq[l].sweepTime = htfRates[b].time;
+               st.sellSideLiq[l].sweepPrice= htfRates[b].low;
 
-            LogInfo(StringFormat("%s Sell-side liquidity swept at %.5f (low=%.5f)",
-                                st.symbol, level, htfRates[b].low));
+               st.bias            = DIR_BULLISH;
+               st.liquidityLevel  = level;
+               st.sweepPrice      = htfRates[b].low;
+               st.sweepTime       = htfRates[b].time;
+               st.sweepBar        = b;
+               st.isPDHSweep      = false;
+               st.isPDLSweep      = false;
+               st.setupStartTime  = TimeCurrent();
+
+               LogInfo(StringFormat("%s Sell-side swing swept at %.5f (low=%.5f)",
+                                   st.symbol, level, htfRates[b].low));
+               return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Detect 15M Displacement & POI (OB / FVG / CHoCH) (Rule 4)         |
+//+------------------------------------------------------------------+
+bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htfCount, double pointVal)
+{
+   if(htfCount < 5 || st.sweepBar < 1) return false;
+
+   double minDisp = MinDisplacementATR * st.currentATR_HTF;
+   if(minDisp <= 0) minDisp = 5 * pointVal;
+
+   // Scan bars formed after the sweep (from sweepBar - 1 down to 1)
+   int startBar = st.sweepBar - 1;
+   if(startBar < 1) startBar = 1;
+
+   for(int b = startBar; b >= 1; b--)
+   {
+      if(st.bias == DIR_BEARISH)
+      {
+         bool isBearish = (htfRates[b].close < htfRates[b].open);
+         double bodySize = htfRates[b].open - htfRates[b].close;
+
+         if(isBearish && (bodySize >= minDisp || bodySize >= 3 * pointVal))
+         {
+            // Structural displacement check (breaking previous low / MSS)
+            bool brokeStructure = false;
+            double refLow = (st.sweepBar + 1 < htfCount) ? htfRates[st.sweepBar + 1].low : htfRates[b].open;
+            if(htfRates[b].close < refLow || htfRates[b].low < refLow) brokeStructure = true;
+            if(b + 1 < htfCount && htfRates[b].close < htfRates[b + 1].low) brokeStructure = true;
+
+            // Check 15M FVG creation
+            bool createdFVG = false;
+            if(b + 1 < htfCount && b - 1 >= 0)
+            {
+               double gapH = htfRates[b + 1].low;
+               double gapL = htfRates[b - 1].high;
+               if(gapH > gapL + MinFVGSizePoints * pointVal)
+               {
+                  createdFVG = true;
+                  st.fvgHigh = gapH;
+                  st.fvgLow  = gapL;
+                  st.fvgTime = htfRates[b].time;
+                  st.fvgDirection = DIR_BEARISH;
+                  st.fvgValid = true;
+               }
+            }
+
+            // Check 15M Order Block creation
+            bool createdOB = false;
+            for(int obIdx = b + 1; obIdx <= b + OBLookbackCandles && obIdx < htfCount; obIdx++)
+            {
+               if(htfRates[obIdx].close > htfRates[obIdx].open)
+               {
+                  st.obHigh      = OBUseBodyOnly ? MathMax(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].high;
+                  st.obLow       = OBUseBodyOnly ? MathMin(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].low;
+                  st.obTime      = htfRates[obIdx].time;
+                  st.obDirection = DIR_BEARISH;
+                  st.obValid     = true;
+                  createdOB      = true;
+                  break;
+               }
+            }
+
+            // If no pure up candle found, fallback to previous candle high/low
+            if(!createdOB && b + 1 < htfCount)
+            {
+               st.obHigh      = htfRates[b + 1].high;
+               st.obLow       = htfRates[b + 1].low;
+               st.obTime      = htfRates[b + 1].time;
+               st.obDirection = DIR_BEARISH;
+               st.obValid     = true;
+               createdOB      = true;
+            }
+
+            st.displacementBar  = b;
+            st.displacementTime = htfRates[b].time;
+            st.displacementSize = bodySize;
+            st.chochBar         = b;
+            st.chochTime        = htfRates[b].time;
+            st.chochLevel       = refLow;
+
+            // Establish POI from OB + FVG
+            if(st.obValid && st.fvgValid)
+            {
+               st.poiHigh = MathMin(st.obHigh, st.fvgHigh);
+               st.poiLow  = MathMax(st.obLow,  st.fvgLow);
+               if(st.poiHigh <= st.poiLow)
+               {
+                  st.poiHigh = MathMax(st.obHigh, st.fvgHigh);
+                  st.poiLow  = MathMin(st.obLow,  st.fvgLow);
+               }
+               st.hasConfluence = true;
+            }
+            else if(st.fvgValid)
+            {
+               st.poiHigh = st.fvgHigh;
+               st.poiLow  = st.fvgLow;
+               st.hasConfluence = false;
+            }
+            else if(st.obValid)
+            {
+               st.poiHigh = st.obHigh;
+               st.poiLow  = st.obLow;
+               st.hasConfluence = false;
+            }
+            else
+            {
+               st.poiHigh = htfRates[b].open;
+               st.poiLow  = (htfRates[b].open + htfRates[b].close) / 2.0;
+               st.hasConfluence = false;
+            }
+
+            LogInfo(StringFormat("%s [15M BEARISH DISPLACEMENT] Bar %d body=%.3f (min=%.3f). POI established: [%.5f - %.5f]",
+                                 st.symbol, b, bodySize, minDisp, st.poiLow, st.poiHigh));
             return true;
          }
+      }
+      else if(st.bias == DIR_BULLISH)
+      {
+         bool isBullish = (htfRates[b].close > htfRates[b].open);
+         double bodySize = htfRates[b].close - htfRates[b].open;
+
+         if(isBullish && (bodySize >= minDisp || bodySize >= 3 * pointVal))
+         {
+            bool brokeStructure = false;
+            double refHigh = (st.sweepBar + 1 < htfCount) ? htfRates[st.sweepBar + 1].high : htfRates[b].open;
+            if(htfRates[b].close > refHigh || htfRates[b].high > refHigh) brokeStructure = true;
+            if(b + 1 < htfCount && htfRates[b].close > htfRates[b + 1].high) brokeStructure = true;
+
+            // Check 15M FVG creation
+            bool createdFVG = false;
+            if(b + 1 < htfCount && b - 1 >= 0)
+            {
+               double gapH = htfRates[b - 1].low;
+               double gapL = htfRates[b + 1].high;
+               if(gapH > gapL + MinFVGSizePoints * pointVal)
+               {
+                  createdFVG = true;
+                  st.fvgHigh = gapH;
+                  st.fvgLow  = gapL;
+                  st.fvgTime = htfRates[b].time;
+                  st.fvgDirection = DIR_BULLISH;
+                  st.fvgValid = true;
+               }
+            }
+
+            // Check 15M Order Block creation
+            bool createdOB = false;
+            for(int obIdx = b + 1; obIdx <= b + OBLookbackCandles && obIdx < htfCount; obIdx++)
+            {
+               if(htfRates[obIdx].close < htfRates[obIdx].open)
+               {
+                  st.obHigh      = OBUseBodyOnly ? MathMax(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].high;
+                  st.obLow       = OBUseBodyOnly ? MathMin(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].low;
+                  st.obTime      = htfRates[obIdx].time;
+                  st.obDirection = DIR_BULLISH;
+                  st.obValid     = true;
+                  createdOB      = true;
+                  break;
+               }
+            }
+
+            // Fallback OB
+            if(!createdOB && b + 1 < htfCount)
+            {
+               st.obHigh      = htfRates[b + 1].high;
+               st.obLow       = htfRates[b + 1].low;
+               st.obTime      = htfRates[b + 1].time;
+               st.obDirection = DIR_BULLISH;
+               st.obValid     = true;
+               createdOB      = true;
+            }
+
+            st.displacementBar  = b;
+            st.displacementTime = htfRates[b].time;
+            st.displacementSize = bodySize;
+            st.chochBar         = b;
+            st.chochTime        = htfRates[b].time;
+            st.chochLevel       = refHigh;
+
+            // Establish POI
+            if(st.obValid && st.fvgValid)
+            {
+               st.poiHigh = MathMin(st.obHigh, st.fvgHigh);
+               st.poiLow  = MathMax(st.obLow,  st.fvgLow);
+               if(st.poiHigh <= st.poiLow)
+               {
+                  st.poiHigh = MathMax(st.obHigh, st.fvgHigh);
+                  st.poiLow  = MathMin(st.obLow,  st.fvgLow);
+               }
+               st.hasConfluence = true;
+            }
+            else if(st.fvgValid)
+            {
+               st.poiHigh = st.fvgHigh;
+               st.poiLow  = st.fvgLow;
+               st.hasConfluence = false;
+            }
+            else if(st.obValid)
+            {
+               st.poiHigh = st.obHigh;
+               st.poiLow  = st.obLow;
+               st.hasConfluence = false;
+            }
+            else
+            {
+               st.poiHigh = (htfRates[b].open + htfRates[b].close) / 2.0;
+               st.poiLow  = htfRates[b].open;
+               st.hasConfluence = false;
+            }
+
+            LogInfo(StringFormat("%s [15M BULLISH DISPLACEMENT] Bar %d body=%.3f (min=%.3f). POI established: [%.5f - %.5f]",
+                                 st.symbol, b, bodySize, minDisp, st.poiLow, st.poiHigh));
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if price has returned to the 15M POI (Rule 5)              |
+//+------------------------------------------------------------------+
+bool CheckPOIRetest(SSymbolState &st, double bid, double ask, double pointVal)
+{
+   if(st.poiHigh <= 0 || st.poiLow <= 0) return false;
+
+   double poiTolerance = 2 * pointVal;
+
+   if(st.bias == DIR_BEARISH)
+   {
+      // Bearish setup: price retraces up into POI
+      if(ask >= st.poiLow - poiTolerance)
+         return true;
+   }
+   else if(st.bias == DIR_BULLISH)
+   {
+      // Bullish setup: price retraces down into POI
+      if(bid <= st.poiHigh + poiTolerance)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Refined Lower Timeframe Confirmation (1M/3M/5M) (Rule 6)          |
+//+------------------------------------------------------------------+
+bool CheckLTFConfirmation(SSymbolState &st, MqlRates &ltfRates[], int ltfCount, double pointVal)
+{
+   if(ltfCount < 3) return false;
+
+   double high1  = ltfRates[1].high;
+   double low1   = ltfRates[1].low;
+   double open1  = ltfRates[1].open;
+   double close1 = ltfRates[1].close;
+   double range1 = high1 - low1;
+   if(range1 <= 0) range1 = pointVal;
+
+   if(st.bias == DIR_BEARISH)
+   {
+      // Candle must interact with the POI
+      if(high1 < st.poiLow - 5 * pointVal) return false;
+
+      // Rejection check: upper wick >= 25% or bearish engulfing or close in lower half
+      double upperWick = high1 - MathMax(open1, close1);
+      bool isBearish   = (close1 < open1);
+      bool wickRej     = (upperWick >= range1 * 0.25);
+      bool engulfing   = (isBearish && close1 < ltfRates[2].low);
+      bool lowerHalf   = (close1 <= low1 + range1 * 0.5);
+
+      bool rejOk       = (wickRej || engulfing || (isBearish && lowerHalf));
+
+      // Micro CHoCH / MSS check: bar 1 closed below bar 2 low
+      bool chochOk     = (close1 < ltfRates[2].low - pointVal);
+
+      switch(LTFConfirmationMethod)
+      {
+         case CONFIRM_LTF_REJECTION: return rejOk;
+         case CONFIRM_LTF_CHOCH:     return chochOk;
+         case CONFIRM_LTF_ANY:       return (rejOk || chochOk);
+      }
+   }
+   else if(st.bias == DIR_BULLISH)
+   {
+      // Candle must interact with the POI
+      if(low1 > st.poiHigh + 5 * pointVal) return false;
+
+      // Rejection check: lower wick >= 25% or bullish engulfing or close in upper half
+      double lowerWick = MathMin(open1, close1) - low1;
+      bool isBullish   = (close1 > open1);
+      bool wickRej     = (lowerWick >= range1 * 0.25);
+      bool engulfing   = (isBullish && close1 > ltfRates[2].high);
+      bool upperHalf   = (close1 >= low1 + range1 * 0.5);
+
+      bool rejOk       = (wickRej || engulfing || (isBullish && upperHalf));
+
+      // Micro CHoCH / MSS check: bar 1 closed above bar 2 high
+      bool chochOk     = (close1 > ltfRates[2].high + pointVal);
+
+      switch(LTFConfirmationMethod)
+      {
+         case CONFIRM_LTF_REJECTION: return rejOk;
+         case CONFIRM_LTF_CHOCH:     return chochOk;
+         case CONFIRM_LTF_ANY:       return (rejOk || chochOk);
       }
    }
    return false;
@@ -1564,6 +2037,11 @@ double CalculateSL(SSymbolState &st, double pointVal)
    double refHigh = (st.poiHigh > 0) ? st.poiHigh : (st.obHigh > 0 ? st.obHigh : st.fvgHigh);
    double refLow  = (st.poiLow > 0)  ? st.poiLow  : (st.obLow > 0  ? st.obLow  : st.fvgLow);
 
+   if(st.sweepPrice > 0)
+   {
+      if(st.bias == DIR_BEARISH && st.sweepPrice > refHigh) refHigh = st.sweepPrice;
+      if(st.bias == DIR_BULLISH && st.sweepPrice < refLow && st.sweepPrice > 0) refLow = st.sweepPrice;
+   }
    if(st.obValid && st.obHigh > refHigh) refHigh = st.obHigh;
    if(st.obValid && st.obLow < refLow && st.obLow > 0) refLow = st.obLow;
 
@@ -1604,6 +2082,12 @@ double CalculateTP(SSymbolState &st, double entryPrice, double slPrice, double p
 
       case TP_LIQUIDITY:
       {
+         // Target external liquidity: opposing PDL for Sell, opposing PDH for Buy
+         if(st.bias == DIR_BEARISH && st.pdlPrice > 0 && st.pdlPrice < entryPrice)
+            return st.pdlPrice;
+         else if(st.bias == DIR_BULLISH && st.pdhPrice > 0 && st.pdhPrice > entryPrice)
+            return st.pdhPrice;
+
          double target = FindLiquidityTarget(st, entryPrice, pointVal);
          if(target > 0) return target;
          if(st.bias == DIR_BEARISH)
@@ -1614,7 +2098,14 @@ double CalculateTP(SSymbolState &st, double entryPrice, double slPrice, double p
 
       case TP_HYBRID:
       {
-         double liqTarget = FindLiquidityTarget(st, entryPrice, pointVal);
+         double liqTarget = 0;
+         if(st.bias == DIR_BEARISH && st.pdlPrice > 0 && st.pdlPrice < entryPrice)
+            liqTarget = st.pdlPrice;
+         else if(st.bias == DIR_BULLISH && st.pdhPrice > 0 && st.pdhPrice > entryPrice)
+            liqTarget = st.pdhPrice;
+         else
+            liqTarget = FindLiquidityTarget(st, entryPrice, pointVal);
+
          double rrTarget  = (st.bias == DIR_BEARISH) ?
                             entryPrice - slDist * RiskRewardRatio :
                             entryPrice + slDist * RiskRewardRatio;
@@ -2145,6 +2636,35 @@ void DrawLiquidityLevel(SSymbolState &st, double price, bool isBuySide, datetime
    ObjectSetString(0, name, OBJPROP_TEXT, isBuySide ? "BSL" : "SSL");
 }
 
+// Draw Previous Day High & Low lines (Rule 1)
+void DrawPreviousDayHLLevels(SSymbolState &st)
+{
+   if(!ShouldDraw() || st.symbol != _Symbol) return;
+   if(st.pdhPrice <= 0 || st.pdlPrice <= 0) return;
+
+   // 1. Draw PDH (Buy-Side Liquidity)
+   string pdhName = EA_TAG + st.symbol + "_PDH_LINE";
+   ObjectDelete(0, pdhName);
+   ObjectCreate(0, pdhName, OBJ_TREND, 0, st.pdhTime, st.pdhPrice, TimeCurrent() + 86400, st.pdhPrice);
+   ObjectSetInteger(0, pdhName, OBJPROP_COLOR, ClrPDH);
+   ObjectSetInteger(0, pdhName, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, pdhName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, pdhName, OBJPROP_RAY_RIGHT, true);
+   ObjectSetInteger(0, pdhName, OBJPROP_BACK, true);
+   ObjectSetString(0, pdhName, OBJPROP_TEXT, "PDH [Buy-Side Liquidity]");
+
+   // 2. Draw PDL (Sell-Side Liquidity)
+   string pdlName = EA_TAG + st.symbol + "_PDL_LINE";
+   ObjectDelete(0, pdlName);
+   ObjectCreate(0, pdlName, OBJ_TREND, 0, st.pdlTime, st.pdlPrice, TimeCurrent() + 86400, st.pdlPrice);
+   ObjectSetInteger(0, pdlName, OBJPROP_COLOR, ClrPDL);
+   ObjectSetInteger(0, pdlName, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, pdlName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, pdlName, OBJPROP_RAY_RIGHT, true);
+   ObjectSetInteger(0, pdlName, OBJPROP_BACK, true);
+   ObjectSetString(0, pdlName, OBJPROP_TEXT, "PDL [Sell-Side Liquidity]");
+}
+
 // Draw a rectangle for Order Block
 void DrawOrderBlock(SSymbolState &st)
 {
@@ -2240,10 +2760,9 @@ void DrawSweepMarker(SSymbolState &st)
    ObjectCreate(0, lblName, OBJ_TEXT, 0, st.sweepTime, st.sweepPrice);
    ObjectSetString(0, lblName, OBJPROP_TEXT, "LIQUIDITY SWEPT");
    ObjectSetInteger(0, lblName, OBJPROP_COLOR, ClrSweepMarker);
-   ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 9);
 }
 
-// Draw CHoCH level
+// Draw CHoCH line on chart
 void DrawCHoCHLine(SSymbolState &st)
 {
    if(!ShouldDraw() || st.symbol != _Symbol) return;
@@ -2368,7 +2887,7 @@ void UpdateDashboard(SSymbolState &st)
    g_lastDashUpdate = now;
 
    int panelX = 10, panelY = 25;
-   int panelW = 310, panelH = 390;
+   int panelW = 310, panelH = 410;
 
    // Background
    string bgName = DASH_TAG + "BG";
@@ -2413,32 +2932,48 @@ void UpdateDashboard(SSymbolState &st)
              biasClr);
    row++;
 
+   // External Liquidity (PDH / PDL - Rule 1)
+   DashLabel(DASH_TAG+"PDH_PDL", x, y + lineH * row,
+             StringFormat("PDH: %.2f  │  PDL: %.2f", st.pdhPrice, st.pdlPrice),
+             clrGold);
+   row++;
+
    // Separator
    DashLabel(DASH_TAG+"S1", x, y + lineH * row, "───────────────────────────", clrDimGray, 8);
    row++;
 
-   // Status indicators
-   string liqSt  = (st.currentState > STATE_WAITING_FOR_LIQUIDITY) ? "✓" :  "⏳";
-   string chochSt = (st.currentState >= STATE_CHOCH_CONFIRMED) ? "✓" :
+   // 7-Step Sequence indicators
+   string liqSt   = (st.currentState > STATE_WAITING_FOR_LIQUIDITY) ? "✓" :  "⏳";
+   string dispSt  = (st.currentState >= STATE_CHOCH_CONFIRMED) ? "✓" :
                     (st.currentState == STATE_WAITING_FOR_CHOCH ? "⏳" : "—");
-   string bosSt  = (st.currentState >= STATE_BOS_CONFIRMED) ? "✓" :
-                   (st.currentState == STATE_WAITING_FOR_BOS ? "⏳" : "—");
-   string obSt   = st.obValid ? "✓" : "—";
-   string fvgSt  = st.fvgValid ? "✓" : "—";
-   string confSt = (st.currentState >= STATE_CONFLUENCE_CONFIRMED) ? "✓" : "—";
+   string poiSt   = (st.poiHigh > 0) ? "✓" : "—";
+   string retSt   = st.poiRetested ? "✓" :
+                    (st.currentState == STATE_WAITING_FOR_RETEST ? "⏳" : "—");
+   string ltfSt   = (st.currentState >= STATE_ORDERS_PLACED) ? "✓" :
+                    (st.currentState == STATE_WAITING_FOR_LTF_CONFIRM ? "⏳" : "—");
 
    DashLabel(DASH_TAG+"R3", x, y + lineH * row,
-             StringFormat("Liquidity:  %s  │  CHoCH: %s", liqSt, chochSt),
+             StringFormat("Liq Sweep:  %s  │  15M Disp: %s", liqSt, dispSt),
              ClrDashText);
    row++;
    DashLabel(DASH_TAG+"R4", x, y + lineH * row,
-             StringFormat("BOS:        %s  │  OB:    %s", bosSt, obSt),
+             StringFormat("15M POI:    %s  │  Retest:   %s", poiSt, retSt),
              ClrDashText);
    row++;
    DashLabel(DASH_TAG+"R5", x, y + lineH * row,
-             StringFormat("FVG:        %s  │  Conf:  %s", fvgSt, confSt),
+             StringFormat("LTF Confirm:%s  │  Trade:    %s", ltfSt, (st.currentState == STATE_POSITION_ACTIVE ? "ACTIVE" : "—")),
              ClrDashText);
    row++;
+
+   // Anti-Re-Entry status (Rule 7)
+   if(BlockReEntryAfterSL && (st.pdhConsumed || st.pdlConsumed))
+   {
+      string consumedSide = st.pdhConsumed ? "PDH" : "PDL";
+      DashLabel(DASH_TAG+"SL_CONS", x, y + lineH * row,
+                StringFormat("Setup Consumed: %s (Wait New Sweep)", consumedSide),
+                clrOrangeRed);
+      row++;
+   }
 
    // Separator
    DashLabel(DASH_TAG+"S2", x, y + lineH * row, "───────────────────────────", clrDimGray, 8);
@@ -2493,8 +3028,8 @@ void UpdateDashboard(SSymbolState &st)
 
    // HTF/LTF info
    DashLabel(DASH_TAG+"R12", x, y + lineH * row,
-             StringFormat("HTF: %s  │  LTF: %s",
-                          EnumToString(HTF_Timeframe), EnumToString(LTF_Timeframe)),
+             StringFormat("Setup: %s  │  Entry: %s",
+                          EnumToString(Setup_Timeframe), EnumToString(Entry_Timeframe)),
              clrDimGray);
    row++;
 
@@ -2509,7 +3044,7 @@ void UpdateDashboard(SSymbolState &st)
 //╚═══════════════════════════════════════════════════════════════════╝
 
 // Reset all active setup data in the state, keeping symbol identity and
-// persistent data (daily stats, processed IDs, counters).
+// persistent data (daily stats, processed IDs, counters, anti-re-entry flags).
 void ResetSetup(SSymbolState &st)
 {
    st.currentState     = STATE_WAITING_FOR_LIQUIDITY;
@@ -2517,6 +3052,9 @@ void ResetSetup(SSymbolState &st)
    st.liquidityLevel   = 0;
    st.sweepPrice       = 0;
    st.sweepTime        = 0;
+   st.sweepBar         = -1;
+   st.isPDHSweep       = false;
+   st.isPDLSweep       = false;
    st.chochLevel       = 0;
    st.chochBar         = 0;
    st.chochTime        = 0;
@@ -2524,6 +3062,8 @@ void ResetSetup(SSymbolState &st)
    st.bosBar           = 0;
    st.bosTime          = 0;
    st.displacementBar  = -1;
+   st.displacementTime = 0;
+   st.displacementSize = 0;
    st.obHigh           = 0;
    st.obLow            = 0;
    st.obTime           = 0;
@@ -2537,6 +3077,8 @@ void ResetSetup(SSymbolState &st)
    st.poiHigh          = 0;
    st.poiLow           = 0;
    st.hasConfluence    = false;
+   st.poiRetested      = false;
+   st.poiRetestTime    = 0;
    st.numPlannedEntries= 0;
    st.orderTicketCount = 0;
    st.slPrice          = 0;
@@ -2544,6 +3086,8 @@ void ResetSetup(SSymbolState &st)
    st.setupStartTime   = 0;
    st.partialCloseDone = false;
    st.targetLiqLevel   = 0;
+   // NOTE: We deliberately do NOT reset pdhConsumed, pdlConsumed, lastFailedSweepTime, lastFailedSweepPrice!
+   // Those persist across reset so that Rule 7 (No immediate re-entry after SL) is strictly enforced.
 }
 
 //╔═══════════════════════════════════════════════════════════════════╗
@@ -2558,6 +3102,11 @@ void ProcessSymbol(int si)
 
    // Update daily stats
    UpdateDailyStats(g_states[si]);
+
+   // Rule 1: Update Previous Day High & Low external liquidity
+   UpdatePreviousDayHL(g_states[si]);
+   if(ShowPDH_PDL_Lines && sym == _Symbol)
+      DrawPreviousDayHLLevels(g_states[si]);
 
    // Check daily risk limit
    if(IsDailyLossExceeded(g_states[si]))
@@ -2576,41 +3125,44 @@ void ProcessSymbol(int si)
    }
 
    // New bar checks
-   bool newHTFBar = IsNewBar(sym, HTF_Timeframe, g_states[si].htfLastBarTime);
-   bool newLTFBar = IsNewBar(sym, LTF_Timeframe, g_states[si].ltfLastBarTime);
+   bool newHTFBar = IsNewBar(sym, Setup_Timeframe, g_states[si].htfLastBarTime);
+   bool newLTFBar = IsNewBar(sym, Entry_Timeframe, g_states[si].ltfLastBarTime);
 
-   // Copy HTF rates — load on every new LTF bar too (not just new HTF bar)
-   // This prevents dead-time after state resets where htfCount=0
+   // Copy Setup Timeframe (15M) rates
    MqlRates htfRates[];
    int htfCount = 0;
    ArraySetAsSeries(htfRates, true);
-   if(newHTFBar || newLTFBar || g_states[si].currentState == STATE_WAITING_FOR_LIQUIDITY)
-   {
-      htfCount = CopyRates(sym, HTF_Timeframe, 0, SwingLookback + HTFSwingStrength + 10, htfRates);
-   }
+   int htfNeeded = SwingLookback + HTFSwingStrength + 15;
+   htfCount = CopyRates(sym, Setup_Timeframe, 0, htfNeeded, htfRates);
 
-   // Copy LTF rates
+   // Copy Entry Timeframe (1M, 3M, or 5M) rates
    MqlRates ltfRates[];
    int ltfCount = 0;
    ArraySetAsSeries(ltfRates, true);
-   if(newLTFBar || g_states[si].currentState >= STATE_WAITING_FOR_CHOCH)
+   int ltfNeeded = SwingLookback + LTFSwingStrength + 15;
+   ltfCount = CopyRates(sym, Entry_Timeframe, 0, ltfNeeded, ltfRates);
+
+   // Update ATR on Setup Timeframe (15M)
+   if(g_states[si].atrHandleHTF != INVALID_HANDLE && htfCount > 0)
    {
-      int ltfBarsNeeded = SwingLookback + LTFSwingStrength + 10;
-      ltfCount = CopyRates(sym, LTF_Timeframe, 0, ltfBarsNeeded, ltfRates);
+      double atrBuf[];
+      ArraySetAsSeries(atrBuf, true);
+      if(CopyBuffer(g_states[si].atrHandleHTF, 0, 0, 3, atrBuf) >= 1)
+         g_states[si].currentATR_HTF = atrBuf[1];
    }
 
-   // Get ATR value on LTF
+   // Update ATR on Entry Timeframe (LTF)
    if(g_states[si].atrHandleLTF != INVALID_HANDLE && ltfCount > 0)
    {
       double atrBuf[];
       ArraySetAsSeries(atrBuf, true);
       if(CopyBuffer(g_states[si].atrHandleLTF, 0, 0, 3, atrBuf) >= 1)
-         g_states[si].currentATR_LTF = atrBuf[1]; // Use last completed bar's ATR
+         g_states[si].currentATR_LTF = atrBuf[1];
    }
 
-   // State machine — process with fall-through for instantaneous transitions
+   // State machine with fall-through for multi-step transitions
    bool stateChanged = true;
-   int maxIterations = 10; // Prevent infinite loops
+   int maxIterations = 10;
 
    while(stateChanged && maxIterations-- > 0)
    {
@@ -2619,33 +3171,33 @@ void ProcessSymbol(int si)
       switch(g_states[si].currentState)
       {
          //───────────────────────────────────────────────────
+         // STEP 1, 2, 3: Previous Day H/L & 15M Liquidity Sweep + Rejection
+         //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_LIQUIDITY:
          {
-            if(htfCount < HTFSwingStrength * 2 + 5) break;
+            if(htfCount < 5) break;
 
-            // Detect HTF swings
-            DetectSwings(htfRates, htfCount, HTFSwingStrength,
-                         g_states[si].htfSwingHighs, g_states[si].htfSwingHighCount,
-                         g_states[si].htfSwingLows,  g_states[si].htfSwingLowCount,
-                         point, MAX_SWINGS);
-
-            if(g_states[si].htfSwingHighCount == 0 && g_states[si].htfSwingLowCount == 0) break;
-
-            // Build liquidity levels
-            BuildLiquidityLevels(g_states[si], point);
-
-            // Draw liquidity levels on chart
-            if(ShowChartObjects && sym == _Symbol)
+            // Swings for alternative / secondary liquidity if enabled
+            if(LiquiditySource == LIQ_SWING_HIGHS_LOWS || LiquiditySource == LIQ_BOTH)
             {
-               for(int l = 0; l < g_states[si].buySideLiqCount; l++)
-                  DrawLiquidityLevel(g_states[si], g_states[si].buySideLiq[l].price,
-                                     true, g_states[si].buySideLiq[l].time);
-               for(int l = 0; l < g_states[si].sellSideLiqCount; l++)
-                  DrawLiquidityLevel(g_states[si], g_states[si].sellSideLiq[l].price,
-                                     false, g_states[si].sellSideLiq[l].time);
+               DetectSwings(htfRates, htfCount, HTFSwingStrength,
+                            g_states[si].htfSwingHighs, g_states[si].htfSwingHighCount,
+                            g_states[si].htfSwingLows,  g_states[si].htfSwingLowCount,
+                            point, MAX_SWINGS);
+               BuildLiquidityLevels(g_states[si], point);
+
+               if(ShowChartObjects && sym == _Symbol)
+               {
+                  for(int l = 0; l < g_states[si].buySideLiqCount; l++)
+                     DrawLiquidityLevel(g_states[si], g_states[si].buySideLiq[l].price,
+                                        true, g_states[si].buySideLiq[l].time);
+                  for(int l = 0; l < g_states[si].sellSideLiqCount; l++)
+                     DrawLiquidityLevel(g_states[si], g_states[si].sellSideLiq[l].price,
+                                        false, g_states[si].sellSideLiq[l].time);
+               }
             }
 
-            // Check for sweep
+            // Check for 15M sweep + rejection against PDH / PDL
             if(CheckLiquiditySweep(g_states[si], htfRates, htfCount, point))
             {
                g_states[si].currentState = STATE_LIQUIDITY_SWEPT;
@@ -2655,186 +3207,52 @@ void ProcessSymbol(int si)
          }
 
          //───────────────────────────────────────────────────
+         // STEP 3 Confirmation: Sweep & Rejection OK -> Mark chart, NO entry yet!
+         //───────────────────────────────────────────────────
          case STATE_LIQUIDITY_SWEPT:
          {
-            // Draw sweep marker
             DrawSweepMarker(g_states[si]);
-
-            // Immediately transition to waiting for CHoCH
+            // Sweep confirmed — strictly wait for 15M displacement
             g_states[si].currentState = STATE_WAITING_FOR_CHOCH;
             stateChanged = true;
             break;
          }
 
          //───────────────────────────────────────────────────
+         // STEP 4: 15M Displacement & POI (OB / FVG) Creation
+         //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_CHOCH:
          {
-            if(!newLTFBar || ltfCount < LTFSwingStrength * 2 + 5)
-            {
-               if(!newLTFBar)
-                  LogDebug(StringFormat("%s WAIT_CHOCH: skipped (not new LTF bar)", sym));
-               break;
-            }
-
-            // Check expiry
-            int age = BarsElapsed(sym, LTF_Timeframe, g_states[si].setupStartTime);
+            int age = BarsElapsed(sym, Setup_Timeframe, g_states[si].setupStartTime);
             if(age > SetupExpirationBars)
             {
-               LogInfo(StringFormat("%s Setup expired while waiting for CHoCH (age=%d bars)", sym, age));
+               LogInfo(StringFormat("%s Setup expired while waiting for 15M displacement (age=%d bars)", sym, age));
                g_states[si].currentState = STATE_SETUP_INVALIDATED;
                stateChanged = true;
                break;
             }
 
-            // Detect LTF swings
-            DetectSwings(ltfRates, ltfCount, LTFSwingStrength,
-                         g_states[si].ltfSwingHighs, g_states[si].ltfSwingHighCount,
-                         g_states[si].ltfSwingLows,  g_states[si].ltfSwingLowCount,
-                         point, MAX_SWINGS);
-
-            // DIAGNOSTIC: Log bar values being compared for CHoCH
-            if(ltfCount >= 5)
+            // Detect strong 15M displacement opposite to sweep, creating OB / FVG / CHoCH
+            if(Detect15MDisplacementAndPOI(g_states[si], htfRates, htfCount, point))
             {
-               LogInfo(StringFormat("%s CHOCH_CHECK: bias=%s bar1[L=%.3f C=%.3f O=%.3f] bar2[L=%.3f] bar3[L=%.3f] bar4[L=%.3f] ATR=%.3f swHL=%d swLL=%d",
-                  sym, DirectionToString(g_states[si].bias),
-                  ltfRates[1].low, ltfRates[1].close, ltfRates[1].open,
-                  ltfRates[2].low, ltfRates[3].low, ltfRates[4].low,
-                  g_states[si].currentATR_LTF,
-                  g_states[si].ltfSwingHighCount, g_states[si].ltfSwingLowCount));
-            }
-
-            // Check for CHoCH
-            if(DetectCHoCH(g_states[si], ltfRates, ltfCount, point))
-            {
-               g_states[si].currentState = STATE_CHOCH_CONFIRMED;
-               stateChanged = true;
-            }
-            break;
-         }
-
-         //───────────────────────────────────────────────────
-         case STATE_CHOCH_CONFIRMED:
-         {
-            DrawCHoCHLine(g_states[si]);
-
-            if(RequireSecondBOS)
-            {
-               g_states[si].currentState = STATE_WAITING_FOR_BOS;
-               LogInfo(StringFormat("%s Waiting for BOS confirmation", sym));
-            }
-            else
-            {
-               g_states[si].currentState = STATE_BOS_CONFIRMED;
-               LogInfo(StringFormat("%s BOS not required — proceeding to OB detection", sym));
-            }
-            stateChanged = true;
-            break;
-         }
-
-         //───────────────────────────────────────────────────
-         case STATE_WAITING_FOR_BOS:
-         {
-            if(!newLTFBar || ltfCount < LTFSwingStrength * 2 + 5) break;
-
-            int age = BarsElapsed(sym, LTF_Timeframe, g_states[si].setupStartTime);
-            if(age > SetupExpirationBars)
-            {
-               LogInfo(StringFormat("%s Setup expired while waiting for BOS", sym));
-               g_states[si].currentState = STATE_SETUP_INVALIDATED;
-               stateChanged = true;
-               break;
-            }
-
-            // Re-detect LTF swings
-            DetectSwings(ltfRates, ltfCount, LTFSwingStrength,
-                         g_states[si].ltfSwingHighs, g_states[si].ltfSwingHighCount,
-                         g_states[si].ltfSwingLows,  g_states[si].ltfSwingLowCount,
-                         point, MAX_SWINGS);
-
-            if(DetectBOS(g_states[si], ltfRates, ltfCount, point))
-            {
-               g_states[si].currentState = STATE_BOS_CONFIRMED;
-               stateChanged = true;
-            }
-            break;
-         }
-
-         //───────────────────────────────────────────────────
-         case STATE_BOS_CONFIRMED:
-         {
-            DrawBOSLine(g_states[si]);
-            g_states[si].currentState = STATE_IDENTIFYING_OB;
-            stateChanged = true;
-            break;
-         }
-
-         //───────────────────────────────────────────────────
-         case STATE_IDENTIFYING_OB:
-         {
-            // Need LTF rates for OB detection
-            if(ltfCount < 5)
-            {
-               int needed = SwingLookback + LTFSwingStrength + 10;
-               ltfCount = CopyRates(sym, LTF_Timeframe, 0, needed, ltfRates);
-               ArraySetAsSeries(ltfRates, true);
-            }
-
-            if(DetectOrderBlock(g_states[si], ltfRates, ltfCount, point))
-            {
-               int obAge = BarsElapsed(sym, LTF_Timeframe, g_states[si].obTime);
-               if(obAge <= OBMaxAgeBars)
-               {
-                  DrawOrderBlock(g_states[si]);
-               }
-               else
-               {
-                  LogWarn(StringFormat("%s OB too old (%d bars > %d max)", sym, obAge, OBMaxAgeBars));
-                  g_states[si].obValid = false;
-               }
-            }
-            // Always proceed to check FVG so either OB or FVG can form the POI
-            g_states[si].currentState = STATE_IDENTIFYING_FVG;
-            stateChanged = true;
-            break;
-         }
-
-         //───────────────────────────────────────────────────
-         case STATE_IDENTIFYING_FVG:
-         {
-            if(ltfCount < 5)
-            {
-               int needed = SwingLookback + LTFSwingStrength + 10;
-               ltfCount = CopyRates(sym, LTF_Timeframe, 0, needed, ltfRates);
-               ArraySetAsSeries(ltfRates, true);
-            }
-
-            bool fvgFound = DetectFVG(g_states[si], ltfRates, ltfCount, point);
-            if(fvgFound) DrawFVG(g_states[si]);
-
-            // Check confluence
-            if(CheckConfluence(g_states[si], point))
-            {
+               DrawCHoCHLine(g_states[si]);
+               if(g_states[si].obValid)  DrawOrderBlock(g_states[si]);
+               if(g_states[si].fvgValid) DrawFVG(g_states[si]);
                DrawConfluence(g_states[si]);
+
                g_states[si].currentState = STATE_CONFLUENCE_CONFIRMED;
                stateChanged = true;
             }
-            else
-            {
-               LogInfo(StringFormat("%s CONFLUENCE_FAILED: obValid=%d fvgValid=%d",
-                  sym, (int)g_states[si].obValid, (int)g_states[si].fvgValid));
-               g_states[si].currentState = STATE_SETUP_INVALIDATED;
-               stateChanged = true;
-            }
             break;
          }
 
          //───────────────────────────────────────────────────
+         // STEP 5 preparation: Build Entry Plan & Calculate SL/TP
+         //───────────────────────────────────────────────────
          case STATE_CONFLUENCE_CONFIRMED:
          {
-            // Build entry plan
             BuildEntryPlan(g_states[si], point);
 
-            // Generate and check setup ID for duplicates
             string setupId = GenerateSetupId(g_states[si]);
             if(IsSetupProcessed(g_states[si], setupId))
             {
@@ -2844,24 +3262,27 @@ void ProcessSymbol(int si)
                break;
             }
 
-            LogInfo(StringFormat("%s Setup confirmed: %s POI=%.5f-%.5f SL=%.5f TP=%.5f",
+            LogInfo(StringFormat("%s [15M POI CREATED] %s POI=[%.5f - %.5f] SL=%.5f TP=%.5f -> Waiting for Retest",
                                  sym, DirectionToString(g_states[si].bias),
-                                 g_states[si].poiHigh, g_states[si].poiLow,
+                                 g_states[si].poiLow, g_states[si].poiHigh,
                                  g_states[si].slPrice, g_states[si].tpPrice));
 
-            g_states[si].currentState = STATE_WAITING_FOR_RETEST;
+            g_states[si].poiRetested   = false;
+            g_states[si].poiRetestTime = 0;
+            g_states[si].currentState  = STATE_WAITING_FOR_RETEST;
             stateChanged = true;
             break;
          }
 
          //───────────────────────────────────────────────────
+         // STEP 5: Wait for POI Retest (Price must return to 15M POI)
+         //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_RETEST:
          {
-            // Check expiry
-            int age = BarsElapsed(sym, LTF_Timeframe, g_states[si].setupStartTime);
-            if(age > SetupExpirationBars)
+            int age = BarsElapsed(sym, Setup_Timeframe, g_states[si].displacementTime);
+            if(age > MaxRetestWaitBars)
             {
-               LogInfo(StringFormat("%s Setup expired while waiting for retest", sym));
+               LogInfo(StringFormat("%s POI retest wait expired (%d bars > %d max)", sym, age, MaxRetestWaitBars));
                g_states[si].currentState = STATE_SETUP_INVALIDATED;
                stateChanged = true;
                break;
@@ -2869,47 +3290,97 @@ void ProcessSymbol(int si)
 
             double bid = SymbolInfoDouble(sym, SYMBOL_BID);
             double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-            
-            // POI invalidation: use 2x ATR as threshold (robust for all instruments)
-            double invalidationDist = g_states[si].currentATR_LTF * 2.0;
-            if(invalidationDist <= 0) invalidationDist = SLBufferPoints * point * 10; // fallback
 
-            double maxBoundHigh = (g_states[si].obValid && g_states[si].obHigh > g_states[si].poiHigh) ? g_states[si].obHigh : g_states[si].poiHigh;
-            double minBoundLow  = (g_states[si].obValid && g_states[si].obLow < g_states[si].poiLow && g_states[si].obLow > 0) ? g_states[si].obLow : g_states[si].poiLow;
-
+            // Invalidation check: price blows through POI / sweep level
             if(g_states[si].bias == DIR_BEARISH)
             {
-               if(maxBoundHigh > 0 && ask > maxBoundHigh + invalidationDist)
+               if(ask > g_states[si].slPrice)
                {
-                  LogInfo(StringFormat("%s POI invalidated: price above POI by %.5f", sym, ask - maxBoundHigh));
+                  LogInfo(StringFormat("%s POI invalidated: ask %.5f broke above SL %.5f", sym, ask, g_states[si].slPrice));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                   break;
                }
             }
-            else
+            else if(g_states[si].bias == DIR_BULLISH)
             {
-               if(minBoundLow > 0 && bid < minBoundLow - invalidationDist)
+               if(bid < g_states[si].slPrice)
                {
-                  LogInfo(StringFormat("%s POI invalidated: price below POI by %.5f", sym, minBoundLow - bid));
+                  LogInfo(StringFormat("%s POI invalidated: bid %.5f broke below SL %.5f", sym, bid, g_states[si].slPrice));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                   break;
                }
             }
 
-            // Entry logic based on mode
-            if(EntryMode == ENTRY_PENDING)
+            // Check if price touched / returned to the 15M POI zone
+            if(CheckPOIRetest(g_states[si], bid, ask, point))
             {
+               g_states[si].poiRetested   = true;
+               g_states[si].poiRetestTime = TimeCurrent();
+               LogInfo(StringFormat("%s [POI RETESTED] Price returned to 15M POI [%.5f - %.5f] -> Waiting for %s confirmation",
+                                    sym, g_states[si].poiLow, g_states[si].poiHigh, EnumToString(Entry_Timeframe)));
+               g_states[si].currentState = STATE_WAITING_FOR_LTF_CONFIRM;
+               stateChanged = true;
+            }
+            break;
+         }
+
+         //───────────────────────────────────────────────────
+         // STEP 6: Refined Entry on 1M, 3M, or 5M
+         //───────────────────────────────────────────────────
+         case STATE_WAITING_FOR_LTF_CONFIRM:
+         {
+            int age = BarsElapsed(sym, Entry_Timeframe, g_states[si].poiRetestTime);
+            if(age > SetupExpirationBars)
+            {
+               LogInfo(StringFormat("%s LTF confirmation wait expired (%d bars)", sym, age));
+               g_states[si].currentState = STATE_SETUP_INVALIDATED;
+               stateChanged = true;
+               break;
+            }
+
+            if(!newLTFBar || ltfCount < 3) break;
+
+            if(CheckLTFConfirmation(g_states[si], ltfRates, ltfCount, point))
+            {
+               LogInfo(StringFormat("%s [LTF CONFIRMED ON %s] Executing entry (%s)",
+                                    sym, EnumToString(Entry_Timeframe), EnumToString(EntryMode)));
                DrawEntryLevels(g_states[si]);
-               if(PlacePendingOrders(g_states[si], point))
+
+               if(EntryMode == ENTRY_PENDING)
                {
-                  g_states[si].currentState = STATE_ORDERS_PLACED;
-                  stateChanged = true;
+                  if(PlacePendingOrders(g_states[si], point))
+                  {
+                     g_states[si].currentState = STATE_ORDERS_PLACED;
+                     stateChanged = true;
+                  }
+                  else if(ExecuteMarketEntry(g_states[si], point))
+                  {
+                     g_states[si].currentState = STATE_POSITION_ACTIVE;
+                     stateChanged = true;
+                  }
+                  else
+                  {
+                     g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                     stateChanged = true;
+                  }
                }
-               else
+               else if(EntryMode == ENTRY_HYBRID)
                {
-                  LogWarn(StringFormat("%s PlacePendingOrders failed — attempting Market Entry fallback", sym));
+                  if(ExecuteHybridEntry(g_states[si], point))
+                  {
+                     g_states[si].currentState = STATE_POSITION_ACTIVE;
+                     stateChanged = true;
+                  }
+                  else
+                  {
+                     g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                     stateChanged = true;
+                  }
+               }
+               else // ENTRY_MARKET
+               {
                   if(ExecuteMarketEntry(g_states[si], point))
                   {
                      g_states[si].currentState = STATE_POSITION_ACTIVE;
@@ -2917,48 +3388,20 @@ void ProcessSymbol(int si)
                   }
                   else
                   {
-                     LogWarn(StringFormat("%s Market fallback also failed — resetting setup", sym));
                      g_states[si].currentState = STATE_SETUP_INVALIDATED;
                      stateChanged = true;
                   }
-               }
-            }
-            else if(EntryMode == ENTRY_HYBRID)
-            {
-               DrawEntryLevels(g_states[si]);
-               if(ExecuteHybridEntry(g_states[si], point))
-               {
-                  g_states[si].currentState = STATE_POSITION_ACTIVE;
-                  stateChanged = true;
-               }
-               else
-               {
-                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
-                  stateChanged = true;
-               }
-            }
-            else // ENTRY_MARKET — enter IMMEDIATELY at market price
-            {
-               DrawEntryLevels(g_states[si]);
-               if(ExecuteMarketEntry(g_states[si], point))
-               {
-                  g_states[si].currentState = STATE_POSITION_ACTIVE;
-                  stateChanged = true;
-               }
-               else
-               {
-                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
-                  stateChanged = true;
                }
             }
             break;
          }
 
          //───────────────────────────────────────────────────
+         // PENDING ORDERS MANAGEMENT
+         //───────────────────────────────────────────────────
          case STATE_ORDERS_PLACED:
          {
-            // Check expiry
-            int age = BarsElapsed(sym, LTF_Timeframe, g_states[si].setupStartTime);
+            int age = BarsElapsed(sym, Entry_Timeframe, g_states[si].setupStartTime);
             if(age > SetupExpirationBars)
             {
                LogInfo(StringFormat("%s Setup expired with pending orders", sym));
@@ -2968,37 +3411,13 @@ void ProcessSymbol(int si)
                break;
             }
 
-            // Check if POI invalidated
-            double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-            double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-
-            if(g_states[si].bias == DIR_BEARISH &&
-               ask > g_states[si].obHigh + SLBufferPoints * point * 2)
-            {
-               LogInfo(StringFormat("%s POI invalidated — deleting pending orders", sym));
-               DeletePendingOrders(g_states[si]);
-               g_states[si].currentState = STATE_SETUP_INVALIDATED;
-               stateChanged = true;
-               break;
-            }
-            else if(g_states[si].bias == DIR_BULLISH &&
-                    bid < g_states[si].obLow - SLBufferPoints * point * 2)
-            {
-               LogInfo(StringFormat("%s POI invalidated — deleting pending orders", sym));
-               DeletePendingOrders(g_states[si]);
-               g_states[si].currentState = STATE_SETUP_INVALIDATED;
-               stateChanged = true;
-               break;
-            }
-
-            // Check if any orders have been filled (positions exist)
+            // Check if any orders have been filled
             if(CountPositions(sym, g_states[si].magicNumber) > 0)
             {
                LogInfo(StringFormat("%s Pending order filled — position active", sym));
                g_states[si].currentState = STATE_POSITION_ACTIVE;
                stateChanged = true;
             }
-            // Check if all pending orders are gone (deleted externally)
             else if(CountPendingOrders(sym, g_states[si].magicNumber) == 0)
             {
                LogWarn(StringFormat("%s All pending orders removed externally", sym));
@@ -3009,30 +3428,78 @@ void ProcessSymbol(int si)
          }
 
          //───────────────────────────────────────────────────
+         // STEP 7: Position active & Anti-Re-Entry after Stop Loss
+         //───────────────────────────────────────────────────
          case STATE_POSITION_ACTIVE:
          {
             // Delete remaining pending orders if any
             if(CountPendingOrders(sym, g_states[si].magicNumber) > 0)
                DeletePendingOrders(g_states[si]);
 
-            // Manage active positions
+            // Trade management
             ManageBreakEven(g_states[si]);
             ManagePartialClose(g_states[si]);
             ManageTrailingStop(g_states[si]);
 
-            // Check if all positions are closed
+            // Check if all positions closed
             if(CountPositions(sym, g_states[si].magicNumber) == 0)
             {
-               // Determine if target was reached or SL hit
-               // Use the daily P/L change as a proxy
-               LogInfo(StringFormat("%s All positions closed — setup complete", sym));
-               g_states[si].currentState = STATE_TARGET_REACHED;
-               stateChanged = true;
+               // Check closed deal profit for this setup
+               datetime fromTime = g_states[si].setupStartTime > 0 ? g_states[si].setupStartTime : TimeCurrent() - 86400;
+               HistorySelect(fromTime, TimeCurrent());
+               int totalDeals = HistoryDealsTotal();
+               double setupProfit = 0;
+               int dealsFound = 0;
+               for(int d = totalDeals - 1; d >= 0; d--)
+               {
+                  ulong dealTicket = HistoryDealGetTicket(d);
+                  if(dealTicket > 0)
+                  {
+                     if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == g_states[si].magicNumber &&
+                        HistoryDealGetString(dealTicket, DEAL_SYMBOL) == sym &&
+                        HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+                     {
+                        setupProfit += HistoryDealGetDouble(dealTicket, DEAL_PROFIT) +
+                                       HistoryDealGetDouble(dealTicket, DEAL_SWAP) +
+                                       HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+                        dealsFound++;
+                     }
+                  }
+               }
+
+               if(dealsFound > 0 && setupProfit < 0)
+               {
+                  // STOP LOSS / LOSS HIT — Rule 7: Invalidate setup & block re-entry
+                  if(BlockReEntryAfterSL)
+                  {
+                     g_states[si].lastFailedSweepTime  = g_states[si].sweepTime;
+                     g_states[si].lastFailedSweepPrice = g_states[si].sweepPrice;
+                     g_states[si].lastFailedBias       = g_states[si].bias;
+                     if(g_states[si].isPDHSweep) g_states[si].pdhConsumed = true;
+                     if(g_states[si].isPDLSweep) g_states[si].pdlConsumed = true;
+
+                     LogWarn(StringFormat("%s [SL HIT - RULE 7] Trade closed with LOSS (%.2f). Setup marked CONSUMED. Immediate re-entry blocked. Waiting for completely new sweep.",
+                                          sym, setupProfit));
+                  }
+                  else
+                  {
+                     LogInfo(StringFormat("%s Trade closed with loss (%.2f)", sym, setupProfit));
+                  }
+                  g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                  stateChanged = true;
+               }
+               else
+               {
+                  // TARGET REACHED / PROFIT
+                  LogInfo(StringFormat("%s [TARGET REACHED] Trade closed in PROFIT (%.2f). Setup completed successfully.",
+                                       sym, setupProfit));
+                  g_states[si].currentState = STATE_TARGET_REACHED;
+                  stateChanged = true;
+               }
             }
             break;
          }
 
-         //───────────────────────────────────────────────────
          case STATE_TARGET_REACHED:
          {
             LogInfo(StringFormat("%s ═══ Setup cycle complete ═══", sym));
@@ -3041,23 +3508,19 @@ void ProcessSymbol(int si)
             break;
          }
 
-         //───────────────────────────────────────────────────
          case STATE_SETUP_INVALIDATED:
          {
-            // Clean up any pending orders
             DeletePendingOrders(g_states[si]);
-            LogInfo(StringFormat("%s Setup invalidated — resetting", sym));
+            LogInfo(StringFormat("%s Setup invalidated — resetting state", sym));
             g_states[si].currentState = STATE_RESET;
             stateChanged = true;
             break;
          }
 
-         //───────────────────────────────────────────────────
          case STATE_RESET:
          {
             ResetSetup(g_states[si]);
-            LogDebug(StringFormat("%s State machine reset — scanning for new setup", sym));
-            // Immediately transition to scanning for new liquidity
+            LogDebug(StringFormat("%s State reset — scanning for new sweep", sym));
             stateChanged = true;
             break;
          }

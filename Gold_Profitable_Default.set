@@ -1,8 +1,15 @@
-; SMC Liquidity EA - Gold Strategy Tester Optimized Preset
+; SMC Liquidity EA - Gold Strategy Tester Optimized Preset (7-Step SMC Sequence)
 MagicNumber=202409
 EAComment=SMC_LIQ
-HTF_Timeframe=16385
-LTF_Timeframe=5
+Setup_Timeframe=15
+Entry_Timeframe=5
+LiquiditySource=0
+ShowPDH_PDL_Lines=true
+ClrPDH=16748572
+ClrPDL=1776415
+LTFConfirmationMethod=2
+MaxRetestWaitBars=50
+BlockReEntryAfterSL=true
 SwingLookback=100
 HTFSwingStrength=2
 LTFSwingStrength=1
