@@ -76,12 +76,20 @@ enum ENUM_ENTRY_MODE
    ENTRY_HYBRID    // Hybrid
 };
 
+enum ENUM_LOT_TYPE
+{
+   LOT_FIXED,        // Fixed Lot Size (Directly Adjustable)
+   LOT_RISK_PERCENT  // Risk-Based Dynamic Lot (% of Account Balance)
+};
+
 enum ENUM_TP_MODE
 {
-   TP_LIQUIDITY,    // Liquidity Target
-   TP_RISK_REWARD,  // Risk:Reward Ratio
-   TP_FIXED_POINTS, // Fixed Points
-   TP_HYBRID        // Hybrid (RR + Liquidity)
+   TP_OPPOSING_OB_OR_LIQ, // Opposing 15M OB or Liquidity (Nearest Obstacle - Recommended)
+   TP_OPPOSING_15M_OB,    // Opposing 15M Order Block Primary
+   TP_LIQUIDITY,          // External Liquidity Target (PDL/PDH / Swings)
+   TP_RISK_REWARD,        // Risk:Reward Ratio
+   TP_FIXED_POINTS,       // Fixed Points
+   TP_HYBRID              // Hybrid (RR + Liquidity)
 };
 
 enum ENUM_SWEEP_MODE
@@ -239,6 +247,8 @@ struct SSymbolState
 
    // Position management
    bool              partialCloseDone;
+   bool              beActivated;      // Has structural break-even been activated (at >= $0.50 profit)
+   double            beHighestProfit;  // Highest floating profit recorded for active trade
 
    // Daily statistics
    double            dailyPnL;
@@ -266,24 +276,26 @@ input long            MagicNumber              = 202409;        // Magic Number
 input string          EAComment                = "SMC_LIQ";     // Order Comment
 
 input group "══════ Timeframes (Client Sequence) ══════"
-input ENUM_TIMEFRAMES Setup_Timeframe          = PERIOD_M15;    // Setup Timeframe (15M Sweep, Displacement, POI)
-input ENUM_TIMEFRAMES Entry_Timeframe          = PERIOD_M5;     // Entry Timeframe (1M, 3M, 5M Confirmation)
+input ENUM_TIMEFRAMES Setup_Timeframe          = PERIOD_M15;    // Setup Timeframe (15M Liquidity Sweep)
+input ENUM_TIMEFRAMES Structure_Timeframe      = PERIOD_M5;     // Structure Timeframe (5M CHOCH, Displacement, OB, FVG)
+input ENUM_TIMEFRAMES Entry_Timeframe          = PERIOD_M5;     // Entry Confirmation Timeframe (1M, 3M, 5M)
 
 #define HTF_Timeframe Setup_Timeframe
 #define LTF_Timeframe Entry_Timeframe
 
 input group "══════ Liquidity Source (PDH / PDL) ══════"
 input ENUM_LIQUIDITY_SOURCE LiquiditySource    = LIQ_PREVIOUS_DAY_HL; // Liquidity Source (PDH/PDL or Swings)
+input bool            StrictDailySweep         = true;                // Strictly Within Current Daily Candle Sweep
 input bool            ShowPDH_PDL_Lines        = true;                // Draw Previous Day High/Low Lines
 input color           ClrPDH                   = clrDodgerBlue;       // PDH (Buy-Side Liquidity) Color
 input color           ClrPDL                   = clrOrangeRed;        // PDL (Sell-Side Liquidity) Color
 
 input group "══════ Lower-Timeframe Entry (1M/3M/5M) ══════"
 input ENUM_LTF_CONFIRMATION LTFConfirmationMethod = CONFIRM_LTF_ANY;  // LTF Confirmation (Rejection/CHoCH/Any)
-input int             MaxRetestWaitBars        = 50;                  // Max 15M Bars To Wait For POI Retest
+input int             MaxRetestWaitBars        = 50;                  // Max Bars To Wait For POI Retest
 
-input group "══════ Re-Entry Protection (Rule 7) ══════"
-input bool            BlockReEntryAfterSL      = true;                // Block Re-Entry on Same Setup After SL
+input group "══════ Strict No-Re-Entry Rule (Rule 2) ══════"
+input bool            BlockReEntryAfterSL      = true;                // Lock/Consume Setup After Trade (No Re-entry)
 
 input group "══════ Swing Detection ══════"
 input int             SwingLookback            = 100;           // HTF Bars To Scan
@@ -326,33 +338,39 @@ input bool            RequireOBFVGConfluence   = false;         // Require OB+FV
 input int             MinOverlapPoints         = 2;             // Min Overlap Size (points)
 input bool            AllowFVGOnlyEntry        = true;          // Allow FVG-Only Entry
 
-input group "══════ Entry & Grid ══════"
-input ENUM_ENTRY_MODE EntryMode                = ENTRY_HYBRID;  // Entry Mode (HYBRID=Market+Grid, MARKET, PENDING)
-input int             NumberOfEntries          = 3;             // Number of Split Entries (Grid 1-10)
+input group "══════ Entry & Risk Management (Rule 5) ══════"
+input ENUM_ENTRY_MODE EntryMode                = ENTRY_MARKET;  // Entry Mode (MARKET, PENDING, HYBRID)
+input int             NumberOfEntries          = 1;             // Active Positions Per Setup (Strictly 1 Position)
 input ENUM_VOLUME_DIST VolumeDist              = VOL_EQUAL;     // Volume Distribution
 
 input group "══════ Capital Protection ══════"
 input int             SLBufferPoints           = 20;            // Protection Buffer Beyond POI (points)
 
-input group "══════ Take Profit ══════"
-input ENUM_TP_MODE    TPMode                   = TP_RISK_REWARD;// TP Mode
-input double          RiskRewardRatio          = 2.0;           // Risk:Reward Ratio
+input group "══════ Take Profit (Rule 3) ══════"
+input ENUM_TP_MODE    TPMode                   = TP_OPPOSING_OB_OR_LIQ; // TP Target Method (Opposing 15M OB / Liquidity)
+input double          RiskRewardRatio          = 2.0;           // Risk:Reward Ratio (Fallback)
 input int             FixedTPPoints            = 500;           // Fixed TP (points)
 
-input group "══════ Risk Management ══════"
-input bool            UseFixedLot              = false;         // Use Fixed Lot (true=Fixed Lot, false=Risk %)
-input double          FixedLotSize             = 0.01;          // Fixed Lot Size
-input double          RiskPercentPerSetup      = 1.0;           // Risk % Per Setup
+input group "══════ Lot Size & Risk Management (Adjustable) ══════"
+input ENUM_LOT_TYPE   LotType                  = LOT_FIXED;     // Lot Mode (Fixed Lot / Risk %)
+input double          FixedLotSize             = 0.01;          // Adjustable Lot Size (e.g. 0.01, 0.05, 0.1, 1.0)
+input double          RiskPercentPerSetup      = 1.0;           // Risk % Per Trade (if using Risk %)
+input bool            UseFixedLot              = true;          // [Legacy] Use Fixed Lot
 input double          MaxAccountRiskPct        = 5.0;           // Max Total Account Risk %
 input int             MaxOpenTrades            = 10;            // Max Simultaneous Open Trades
 input double          DailyRiskLimitPct        = 5.0;           // Daily Risk Limit %
 input int             MaxDailyTrades           = 20;            // Max Daily Trades
 
-input group "══════ Position Management ══════"
-input bool            EnablePartialClose       = true;          // Enable Partial Close
-input double          PartialClosePct          = 50.0;          // Partial Close % of Volume
-input bool            MoveSLToBreakEven        = true;          // Move SL to Break-Even at 1R
+input group "══════ Structural Break-Even Protection (Rule 4) ══════"
+input bool            EnableBreakEvenProtection= true;          // Enable Break-Even Protection
+input double          BEProfitUSD              = 0.50;          // Floating Profit Trigger ($ USD, e.g. $0.50)
+input ENUM_TIMEFRAMES BE_Structure_Timeframe   = PERIOD_M1;     // Structural Swing Timeframe (1M or 3M)
+input int             BEBufferPoints           = 5;             // BE Buffer Points Beyond Entry
+input int             BESwingLookback          = 25;            // Structural Swing Lookback Bars
+input bool            MoveSLToBreakEven        = true;          // [Legacy] Move SL to Break-Even at 1R
 input int             TrailingStopPoints       = 0;             // Trailing Stop (points, 0=off)
+input bool            EnablePartialClose       = false;         // Enable Partial Close
+input double          PartialClosePct          = 50.0;          // Partial Close % of Volume
 
 input group "══════ Session Filter ══════"
 input bool            UseSessionFilter         = false;         // Enable Session Filter
@@ -745,6 +763,10 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
    double sweepBuf = SweepBufferPoints * pointVal;
    double minSweep = MinSweepDistPoints * pointVal;
 
+   datetime currentDayStart = iTime(st.symbol, PERIOD_D1, 0);
+   if(currentDayStart == 0)
+      currentDayStart = st.d1LastBarTime + PeriodSeconds(PERIOD_D1);
+
    // 1. Check Previous Day High & Low (External Liquidity - Primary Client Method)
    if(LiquiditySource == LIQ_PREVIOUS_DAY_HL || LiquiditySource == LIQ_BOTH)
    {
@@ -754,11 +776,14 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
          double level = st.pdhPrice;
          for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
+            // Strict Daily Filter: Must be within current daily candle
+            if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
+
             if(BlockReEntryAfterSL)
             {
                // Skip the exact candle that caused the failed trade
                if(st.lastFailedSweepTime == htfRates[b].time) continue;
-               // If PDH was already consumed by an SL, require a brand new higher sweep above the failed sweep extreme
+               // If PDH was already consumed, require a brand new higher sweep above the failed sweep extreme
                if(st.pdhConsumed && (st.lastFailedSweepPrice > 0 && htfRates[b].high <= st.lastFailedSweepPrice + minSweep)) continue;
             }
 
@@ -785,8 +810,8 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
                st.pdhConsumed    = false; // Reset on valid new sweep
                st.setupStartTime = TimeCurrent();
 
-               LogInfo(StringFormat("%s [15M PDH SWEEP + REJECTION] Buy-side swept at %.5f (high=%.5f, bar=%d) -> SELL SETUP (Waiting for 15M Displacement)",
-                                    st.symbol, level, htfRates[b].high, b));
+               LogInfo(StringFormat("%s [15M PDH SWEEP (TODAY)] Buy-side swept at %.5f (high=%.5f, bar=%d, time=%s) -> SELL SETUP (Waiting for 5M Displacement & POI)",
+                                    st.symbol, level, htfRates[b].high, b, TimeToString(htfRates[b].time, TIME_MINUTES)));
                return true;
             }
          }
@@ -798,11 +823,14 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
          double level = st.pdlPrice;
          for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
+            // Strict Daily Filter: Must be within current daily candle
+            if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
+
             if(BlockReEntryAfterSL)
             {
                // Skip the exact candle that caused the failed trade
                if(st.lastFailedSweepTime == htfRates[b].time) continue;
-               // If PDL was already consumed by an SL, require a brand new lower sweep below the failed sweep extreme
+               // If PDL was already consumed, require a brand new lower sweep below the failed sweep extreme
                if(st.pdlConsumed && (st.lastFailedSweepPrice > 0 && htfRates[b].low >= st.lastFailedSweepPrice - minSweep)) continue;
             }
 
@@ -848,6 +876,7 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
 
          for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
+            if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
             if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
             double penetration = htfRates[b].high - level;
             if(penetration < sweepBuf) continue;
@@ -883,6 +912,7 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
 
          for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
          {
+            if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
             if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
             double penetration = level - htfRates[b].low;
             if(penetration < sweepBuf) continue;
@@ -914,60 +944,82 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
 }
 
 //+------------------------------------------------------------------+
-//| Detect 15M Displacement & POI (OB / FVG / CHoCH) (Rule 4)         |
+//| Detect Structure Displacement & POI (OB / FVG / CHoCH) (Rule 1)   |
+//| Evaluates on Structure_Timeframe (e.g. 5M CHOCH, Displacement)   |
 //+------------------------------------------------------------------+
-bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htfCount, double pointVal)
+bool DetectStructureDisplacementAndPOI(SSymbolState &st, ENUM_TIMEFRAMES tf, double pointVal)
 {
-   if(htfCount < 5 || st.sweepBar < 1) return false;
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int needed = 60;
+   int count = CopyRates(st.symbol, tf, 0, needed, rates);
+   if(count < 5) return false;
 
-   double minDisp = MinDisplacementATR * st.currentATR_HTF;
-   if(minDisp <= 0) minDisp = 5 * pointVal;
+   // Calculate ATR on structure timeframe
+   double sumATR = 0;
+   int atrPeriod = MathMin(14, count - 2);
+   for(int i = 1; i <= atrPeriod; i++)
+   {
+      double tr = MathMax(rates[i].high - rates[i].low, 
+                  MathMax(MathAbs(rates[i].high - rates[i + 1].close), 
+                          MathAbs(rates[i].low - rates[i + 1].close)));
+      sumATR += tr;
+   }
+   double tfATR = (atrPeriod > 0) ? (sumATR / (double)atrPeriod) : (10 * pointVal);
+   double minDisp = MinDisplacementATR * tfATR;
+   if(minDisp <= 0) minDisp = 3 * pointVal;
 
-   // Scan bars formed after the sweep (from sweepBar - 1 down to 1)
-   int startBar = st.sweepBar - 1;
-   if(startBar < 1) startBar = 1;
+   // Scan bars formed after or during the sweep (rates[b].time >= st.sweepTime)
+   int startBar = -1;
+   for(int i = 1; i < count; i++)
+   {
+      if(rates[i].time <= st.sweepTime)
+      {
+         startBar = i;
+         break;
+      }
+   }
+   if(startBar < 1) startBar = MathMin(count - 2, 20);
 
    for(int b = startBar; b >= 1; b--)
    {
       if(st.bias == DIR_BEARISH)
       {
-         bool isBearish = (htfRates[b].close < htfRates[b].open);
-         double bodySize = htfRates[b].open - htfRates[b].close;
+         bool isBearish = (rates[b].close < rates[b].open);
+         double bodySize = rates[b].open - rates[b].close;
 
          if(isBearish && (bodySize >= minDisp || bodySize >= 3 * pointVal))
          {
-            // Structural displacement check (breaking previous low / MSS)
-            bool brokeStructure = false;
-            double refLow = (st.sweepBar + 1 < htfCount) ? htfRates[st.sweepBar + 1].low : htfRates[b].open;
-            if(htfRates[b].close < refLow || htfRates[b].low < refLow) brokeStructure = true;
-            if(b + 1 < htfCount && htfRates[b].close < htfRates[b + 1].low) brokeStructure = true;
+            // Structural displacement check (breaking previous low / MSS / CHOCH)
+            double refLow = (b + 1 < count) ? rates[b + 1].low : rates[b].open;
+            if(b + 2 < count && rates[b + 2].low < refLow) refLow = rates[b + 2].low;
 
-            // Check 15M FVG creation
+            // Check FVG creation
             bool createdFVG = false;
-            if(b + 1 < htfCount && b - 1 >= 0)
+            if(b + 1 < count && b - 1 >= 0)
             {
-               double gapH = htfRates[b + 1].low;
-               double gapL = htfRates[b - 1].high;
+               double gapH = rates[b + 1].low;
+               double gapL = rates[b - 1].high;
                if(gapH > gapL + MinFVGSizePoints * pointVal)
                {
                   createdFVG = true;
                   st.fvgHigh = gapH;
                   st.fvgLow  = gapL;
-                  st.fvgTime = htfRates[b].time;
+                  st.fvgTime = rates[b].time;
                   st.fvgDirection = DIR_BEARISH;
                   st.fvgValid = true;
                }
             }
 
-            // Check 15M Order Block creation
+            // Check Order Block creation (last bullish candle before displacement)
             bool createdOB = false;
-            for(int obIdx = b + 1; obIdx <= b + OBLookbackCandles && obIdx < htfCount; obIdx++)
+            for(int obIdx = b + 1; obIdx <= b + OBLookbackCandles && obIdx < count; obIdx++)
             {
-               if(htfRates[obIdx].close > htfRates[obIdx].open)
+               if(rates[obIdx].close > rates[obIdx].open)
                {
-                  st.obHigh      = OBUseBodyOnly ? MathMax(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].high;
-                  st.obLow       = OBUseBodyOnly ? MathMin(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].low;
-                  st.obTime      = htfRates[obIdx].time;
+                  st.obHigh      = OBUseBodyOnly ? MathMax(rates[obIdx].open, rates[obIdx].close) : rates[obIdx].high;
+                  st.obLow       = OBUseBodyOnly ? MathMin(rates[obIdx].open, rates[obIdx].close) : rates[obIdx].low;
+                  st.obTime      = rates[obIdx].time;
                   st.obDirection = DIR_BEARISH;
                   st.obValid     = true;
                   createdOB      = true;
@@ -975,25 +1027,25 @@ bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htf
                }
             }
 
-            // If no pure up candle found, fallback to previous candle high/low
-            if(!createdOB && b + 1 < htfCount)
+            // Fallback OB
+            if(!createdOB && b + 1 < count)
             {
-               st.obHigh      = htfRates[b + 1].high;
-               st.obLow       = htfRates[b + 1].low;
-               st.obTime      = htfRates[b + 1].time;
+               st.obHigh      = rates[b + 1].high;
+               st.obLow       = rates[b + 1].low;
+               st.obTime      = rates[b + 1].time;
                st.obDirection = DIR_BEARISH;
                st.obValid     = true;
                createdOB      = true;
             }
 
             st.displacementBar  = b;
-            st.displacementTime = htfRates[b].time;
+            st.displacementTime = rates[b].time;
             st.displacementSize = bodySize;
             st.chochBar         = b;
-            st.chochTime        = htfRates[b].time;
+            st.chochTime        = rates[b].time;
             st.chochLevel       = refLow;
 
-            // Establish POI from OB + FVG
+            // Establish POI
             if(st.obValid && st.fvgValid)
             {
                st.poiHigh = MathMin(st.obHigh, st.fvgHigh);
@@ -1005,68 +1057,67 @@ bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htf
                }
                st.hasConfluence = true;
             }
-            else if(st.fvgValid)
-            {
-               st.poiHigh = st.fvgHigh;
-               st.poiLow  = st.fvgLow;
-               st.hasConfluence = false;
-            }
             else if(st.obValid)
             {
                st.poiHigh = st.obHigh;
                st.poiLow  = st.obLow;
                st.hasConfluence = false;
             }
+            else if(st.fvgValid)
+            {
+               st.poiHigh = st.fvgHigh;
+               st.poiLow  = st.fvgLow;
+               st.hasConfluence = false;
+            }
             else
             {
-               st.poiHigh = htfRates[b].open;
-               st.poiLow  = (htfRates[b].open + htfRates[b].close) / 2.0;
+               st.poiHigh = rates[b].open;
+               st.poiLow  = (rates[b].open + rates[b].close) / 2.0;
                st.hasConfluence = false;
             }
 
-            LogInfo(StringFormat("%s [15M BEARISH DISPLACEMENT] Bar %d body=%.3f (min=%.3f). POI established: [%.5f - %.5f]",
-                                 st.symbol, b, bodySize, minDisp, st.poiLow, st.poiHigh));
+            LogInfo(StringFormat("%s [%s BEARISH DISPLACEMENT & CHOCH] Bar %d body=%.3f (min=%.3f). POI [%.5f - %.5f]",
+                                 st.symbol, EnumToString(tf), b, bodySize, minDisp, st.poiLow, st.poiHigh));
             return true;
          }
       }
       else if(st.bias == DIR_BULLISH)
       {
-         bool isBullish = (htfRates[b].close > htfRates[b].open);
-         double bodySize = htfRates[b].close - htfRates[b].open;
+         bool isBullish = (rates[b].close > rates[b].open);
+         double bodySize = rates[b].close - rates[b].open;
 
          if(isBullish && (bodySize >= minDisp || bodySize >= 3 * pointVal))
          {
-            bool brokeStructure = false;
-            double refHigh = (st.sweepBar + 1 < htfCount) ? htfRates[st.sweepBar + 1].high : htfRates[b].open;
-            if(htfRates[b].close > refHigh || htfRates[b].high > refHigh) brokeStructure = true;
-            if(b + 1 < htfCount && htfRates[b].close > htfRates[b + 1].high) brokeStructure = true;
+            // Structural displacement check (breaking previous high / MSS / CHOCH)
+            double refHigh = (b + 1 < count) ? rates[b + 1].high : rates[b].open;
+            if(b + 2 < count && rates[b + 2].high > refHigh) refHigh = rates[b + 2].high;
 
-            // Check 15M FVG creation
+            // Check FVG creation
             bool createdFVG = false;
-            if(b + 1 < htfCount && b - 1 >= 0)
+            if(b + 1 < count && b - 1 >= 0)
             {
-               double gapH = htfRates[b - 1].low;
-               double gapL = htfRates[b + 1].high;
+               double gapH = rates[b - 1].low;
+               double gapL = rates[b + 1].high;
                if(gapH > gapL + MinFVGSizePoints * pointVal)
                {
                   createdFVG = true;
                   st.fvgHigh = gapH;
                   st.fvgLow  = gapL;
-                  st.fvgTime = htfRates[b].time;
+                  st.fvgTime = rates[b].time;
                   st.fvgDirection = DIR_BULLISH;
                   st.fvgValid = true;
                }
             }
 
-            // Check 15M Order Block creation
+            // Check Order Block creation (last bearish candle before displacement)
             bool createdOB = false;
-            for(int obIdx = b + 1; obIdx <= b + OBLookbackCandles && obIdx < htfCount; obIdx++)
+            for(int obIdx = b + 1; obIdx <= b + OBLookbackCandles && obIdx < count; obIdx++)
             {
-               if(htfRates[obIdx].close < htfRates[obIdx].open)
+               if(rates[obIdx].close < rates[obIdx].open)
                {
-                  st.obHigh      = OBUseBodyOnly ? MathMax(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].high;
-                  st.obLow       = OBUseBodyOnly ? MathMin(htfRates[obIdx].open, htfRates[obIdx].close) : htfRates[obIdx].low;
-                  st.obTime      = htfRates[obIdx].time;
+                  st.obHigh      = OBUseBodyOnly ? MathMax(rates[obIdx].open, rates[obIdx].close) : rates[obIdx].high;
+                  st.obLow       = OBUseBodyOnly ? MathMin(rates[obIdx].open, rates[obIdx].close) : rates[obIdx].low;
+                  st.obTime      = rates[obIdx].time;
                   st.obDirection = DIR_BULLISH;
                   st.obValid     = true;
                   createdOB      = true;
@@ -1075,21 +1126,21 @@ bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htf
             }
 
             // Fallback OB
-            if(!createdOB && b + 1 < htfCount)
+            if(!createdOB && b + 1 < count)
             {
-               st.obHigh      = htfRates[b + 1].high;
-               st.obLow       = htfRates[b + 1].low;
-               st.obTime      = htfRates[b + 1].time;
+               st.obHigh      = rates[b + 1].high;
+               st.obLow       = rates[b + 1].low;
+               st.obTime      = rates[b + 1].time;
                st.obDirection = DIR_BULLISH;
                st.obValid     = true;
                createdOB      = true;
             }
 
             st.displacementBar  = b;
-            st.displacementTime = htfRates[b].time;
+            st.displacementTime = rates[b].time;
             st.displacementSize = bodySize;
             st.chochBar         = b;
-            st.chochTime        = htfRates[b].time;
+            st.chochTime        = rates[b].time;
             st.chochLevel       = refHigh;
 
             // Establish POI
@@ -1104,32 +1155,38 @@ bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htf
                }
                st.hasConfluence = true;
             }
-            else if(st.fvgValid)
-            {
-               st.poiHigh = st.fvgHigh;
-               st.poiLow  = st.fvgLow;
-               st.hasConfluence = false;
-            }
             else if(st.obValid)
             {
                st.poiHigh = st.obHigh;
                st.poiLow  = st.obLow;
                st.hasConfluence = false;
             }
+            else if(st.fvgValid)
+            {
+               st.poiHigh = st.fvgHigh;
+               st.poiLow  = st.fvgLow;
+               st.hasConfluence = false;
+            }
             else
             {
-               st.poiHigh = (htfRates[b].open + htfRates[b].close) / 2.0;
-               st.poiLow  = htfRates[b].open;
+               st.poiHigh = (rates[b].open + rates[b].close) / 2.0;
+               st.poiLow  = rates[b].open;
                st.hasConfluence = false;
             }
 
-            LogInfo(StringFormat("%s [15M BULLISH DISPLACEMENT] Bar %d body=%.3f (min=%.3f). POI established: [%.5f - %.5f]",
-                                 st.symbol, b, bodySize, minDisp, st.poiLow, st.poiHigh));
+            LogInfo(StringFormat("%s [%s BULLISH DISPLACEMENT & CHOCH] Bar %d body=%.3f (min=%.3f). POI [%.5f - %.5f]",
+                                 st.symbol, EnumToString(tf), b, bodySize, minDisp, st.poiLow, st.poiHigh));
             return true;
          }
       }
    }
    return false;
+}
+
+// Backward-compatibility wrapper
+bool Detect15MDisplacementAndPOI(SSymbolState &st, MqlRates &htfRates[], int htfCount, double pointVal)
+{
+   return DetectStructureDisplacementAndPOI(st, Structure_Timeframe, pointVal);
 }
 
 //+------------------------------------------------------------------+
@@ -1755,7 +1812,7 @@ double CalculateLotSize(string sym, double riskPct, double entryPrice, double sl
    double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
    if(minLot <= 0) minLot = 0.01;
 
-   if(UseFixedLot && FixedLotSize > 0)
+   if((LotType == LOT_FIXED || UseFixedLot) && FixedLotSize > 0)
       return NormalizeLots(sym, FixedLotSize);
 
    double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -2057,64 +2114,158 @@ double CalculateSL(SSymbolState &st, double pointVal)
       return refLow - buffer * pointVal;
 }
 
-// Calculate TP price based on mode
+// Find the next opposing 15M Order Block as a TP target / obstacle (Rule 3)
+double FindOpposing15MOrderBlock(string sym, ENUM_DIRECTION tradeBias, double entryPrice, double pointVal)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(sym, PERIOD_M15, 0, 100, rates);
+   if(copied < 10) return 0;
+
+   double minDistance = 25 * pointVal;
+
+   if(tradeBias == DIR_BEARISH)
+   {
+      // SELL trade: Look below entryPrice for nearest opposing Bullish 15M OB
+      double nearestTarget = 0;
+      double nearestDist   = DBL_MAX;
+
+      for(int i = 2; i < copied - 2; i++)
+      {
+         if(rates[i].close < rates[i].open) // Down-close candle
+         {
+            // Expansion upward after this candle
+            bool expandedUp = false;
+            for(int f = i - 1; f >= MathMax(1, i - 4); f--)
+            {
+               if(rates[f].close > rates[i].high) { expandedUp = true; break; }
+            }
+
+            if(expandedUp)
+            {
+               double obHigh = rates[i].high;
+               if(obHigh < entryPrice - minDistance)
+               {
+                  double dist = entryPrice - obHigh;
+                  if(dist < nearestDist)
+                  {
+                     nearestDist   = dist;
+                     nearestTarget = obHigh;
+                  }
+               }
+            }
+         }
+      }
+      return nearestTarget;
+   }
+   else if(tradeBias == DIR_BULLISH)
+   {
+      // BUY trade: Look above entryPrice for nearest opposing Bearish 15M OB
+      double nearestTarget = 0;
+      double nearestDist   = DBL_MAX;
+
+      for(int i = 2; i < copied - 2; i++)
+      {
+         if(rates[i].close > rates[i].open) // Up-close candle
+         {
+            // Expansion downward after this candle
+            bool expandedDown = false;
+            for(int f = i - 1; f >= MathMax(1, i - 4); f--)
+            {
+               if(rates[f].close < rates[i].low) { expandedDown = true; break; }
+            }
+
+            if(expandedDown)
+            {
+               double obLow = rates[i].low;
+               if(obLow > entryPrice + minDistance)
+               {
+                  double dist = obLow - entryPrice;
+                  if(dist < nearestDist)
+                  {
+                     nearestDist   = dist;
+                     nearestTarget = obLow;
+                  }
+               }
+            }
+         }
+      }
+      return nearestTarget;
+   }
+   return 0;
+}
+
+// Calculate TP price based on mode (Rule 3)
 double CalculateTP(SSymbolState &st, double entryPrice, double slPrice, double pointVal)
 {
    double slDist = MathAbs(entryPrice - slPrice);
 
+   // 1. Check opposing 15M Order Block target
+   double obTarget = FindOpposing15MOrderBlock(st.symbol, st.bias, entryPrice, pointVal);
+
+   // 2. Check external liquidity target (opposing PDL/PDH or swing H/L)
+   double liqTarget = 0;
+   if(st.bias == DIR_BEARISH && st.pdlPrice > 0 && st.pdlPrice < entryPrice)
+      liqTarget = st.pdlPrice;
+   else if(st.bias == DIR_BULLISH && st.pdhPrice > 0 && st.pdhPrice > entryPrice)
+      liqTarget = st.pdhPrice;
+   else
+      liqTarget = FindLiquidityTarget(st, entryPrice, pointVal);
+
    switch(TPMode)
    {
-      case TP_RISK_REWARD:
+      case TP_OPPOSING_OB_OR_LIQ:
       {
+         // Rule 3: Choose valid target in direction of trade; do NOT place TP beyond a nearer opposing obstacle
          if(st.bias == DIR_BEARISH)
+         {
+            if(obTarget > 0 && liqTarget > 0)
+               return MathMax(obTarget, liqTarget); // Higher price is the nearer obstacle below entry
+            if(obTarget > 0)  return obTarget;
+            if(liqTarget > 0) return liqTarget;
             return entryPrice - slDist * RiskRewardRatio;
-         else
+         }
+         else // DIR_BULLISH
+         {
+            if(obTarget > 0 && liqTarget > 0)
+               return MathMin(obTarget, liqTarget); // Lower price is the nearer obstacle above entry
+            if(obTarget > 0)  return obTarget;
+            if(liqTarget > 0) return liqTarget;
             return entryPrice + slDist * RiskRewardRatio;
+         }
       }
 
-      case TP_FIXED_POINTS:
+      case TP_OPPOSING_15M_OB:
       {
-         if(st.bias == DIR_BEARISH)
-            return entryPrice - FixedTPPoints * pointVal;
-         else
-            return entryPrice + FixedTPPoints * pointVal;
+         if(obTarget > 0) return obTarget;
+         if(liqTarget > 0) return liqTarget;
+         return (st.bias == DIR_BEARISH) ? (entryPrice - slDist * RiskRewardRatio) : (entryPrice + slDist * RiskRewardRatio);
       }
 
       case TP_LIQUIDITY:
       {
-         // Target external liquidity: opposing PDL for Sell, opposing PDH for Buy
-         if(st.bias == DIR_BEARISH && st.pdlPrice > 0 && st.pdlPrice < entryPrice)
-            return st.pdlPrice;
-         else if(st.bias == DIR_BULLISH && st.pdhPrice > 0 && st.pdhPrice > entryPrice)
-            return st.pdhPrice;
+         if(liqTarget > 0) return liqTarget;
+         if(obTarget > 0) return obTarget;
+         return (st.bias == DIR_BEARISH) ? (entryPrice - slDist * RiskRewardRatio) : (entryPrice + slDist * RiskRewardRatio);
+      }
 
-         double target = FindLiquidityTarget(st, entryPrice, pointVal);
-         if(target > 0) return target;
-         if(st.bias == DIR_BEARISH)
-            return entryPrice - slDist * RiskRewardRatio;
-         else
-            return entryPrice + slDist * RiskRewardRatio;
+      case TP_RISK_REWARD:
+      {
+         return (st.bias == DIR_BEARISH) ? (entryPrice - slDist * RiskRewardRatio) : (entryPrice + slDist * RiskRewardRatio);
+      }
+
+      case TP_FIXED_POINTS:
+      {
+         return (st.bias == DIR_BEARISH) ? (entryPrice - FixedTPPoints * pointVal) : (entryPrice + FixedTPPoints * pointVal);
       }
 
       case TP_HYBRID:
       {
-         double liqTarget = 0;
-         if(st.bias == DIR_BEARISH && st.pdlPrice > 0 && st.pdlPrice < entryPrice)
-            liqTarget = st.pdlPrice;
-         else if(st.bias == DIR_BULLISH && st.pdhPrice > 0 && st.pdhPrice > entryPrice)
-            liqTarget = st.pdhPrice;
-         else
-            liqTarget = FindLiquidityTarget(st, entryPrice, pointVal);
-
-         double rrTarget  = (st.bias == DIR_BEARISH) ?
-                            entryPrice - slDist * RiskRewardRatio :
-                            entryPrice + slDist * RiskRewardRatio;
-         if(liqTarget > 0)
+         double rrTarget = (st.bias == DIR_BEARISH) ? (entryPrice - slDist * RiskRewardRatio) : (entryPrice + slDist * RiskRewardRatio);
+         double target = (obTarget > 0) ? obTarget : liqTarget;
+         if(target > 0)
          {
-            if(st.bias == DIR_BEARISH)
-               return MathMax(liqTarget, rrTarget);
-            else
-               return MathMin(liqTarget, rrTarget);
+            return (st.bias == DIR_BEARISH) ? MathMax(target, rrTarget) : MathMin(target, rrTarget);
          }
          return rrTarget;
       }
@@ -2462,10 +2613,13 @@ void DeletePendingOrders(SSymbolState &st)
 //║                POSITION MANAGEMENT                               ║
 //╚═══════════════════════════════════════════════════════════════════╝
 
-// Manage break-even: move SL to entry when profit reaches 1R
+// Manage break-even protection using 1M or 3M structure (Rule 4)
 void ManageBreakEven(SSymbolState &st)
 {
-   if(!MoveSLToBreakEven) return;
+   if(!EnableBreakEvenProtection && !MoveSLToBreakEven) return;
+
+   double point  = SymPoint(st.symbol);
+   int    digits = SymDigits(st.symbol);
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -2474,38 +2628,118 @@ void ManageBreakEven(SSymbolState &st)
       if(PositionGetInteger(POSITION_MAGIC) != st.magicNumber) continue;
       if(PositionGetString(POSITION_SYMBOL) != st.symbol) continue;
 
+      double profit    = PositionGetDouble(POSITION_PROFIT);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentSL = PositionGetDouble(POSITION_SL);
       double tp        = PositionGetDouble(POSITION_TP);
-      double point     = SymPoint(st.symbol);
-      int    digits    = SymDigits(st.symbol);
+      long   posType   = PositionGetInteger(POSITION_TYPE);
 
-      if((int)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      // Track highest floating profit
+      if(profit > st.beHighestProfit) st.beHighestProfit = profit;
+
+      // Condition: Once floating profit reaches at least BEProfitUSD (default $0.50)
+      if(!st.beActivated)
       {
-         if(currentSL >= openPrice) continue; // Already at BE or better
-         double bid = SymbolInfoDouble(st.symbol, SYMBOL_BID);
-         double riskDist = openPrice - currentSL;
-         if(riskDist <= 0) continue;
-
-         if(bid >= openPrice + riskDist)
+         if(profit >= BEProfitUSD)
          {
-            double newSL = NormalizeDouble(openPrice + point, digits);
-            g_trade.PositionModify(ticket, newSL, tp);
-            LogInfo(StringFormat("%s Buy position %d moved to break-even", st.symbol, ticket));
+            st.beActivated = true;
+            LogInfo(StringFormat("%s [BE TRIGGER] Position %d floating profit reached $%.2f (>= $%.2f) — Activating structural break-even protection",
+                                 st.symbol, ticket, profit, BEProfitUSD));
          }
       }
-      else if((int)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-      {
-         if(currentSL <= openPrice && currentSL > 0) continue;
-         double ask = SymbolInfoDouble(st.symbol, SYMBOL_ASK);
-         double riskDist = currentSL - openPrice;
-         if(riskDist <= 0) continue;
 
-         if(ask <= openPrice - riskDist)
+      // Preserve original SL until break-even condition is met
+      if(!st.beActivated) continue;
+
+      double beBuffer = BEBufferPoints * point;
+
+      // Copy closed candles from 1M or 3M (confirmed structure)
+      MqlRates beRates[];
+      ArraySetAsSeries(beRates, true);
+      int copied = CopyRates(st.symbol, BE_Structure_Timeframe, 1, BESwingLookback + 5, beRates);
+
+      if(posType == POSITION_TYPE_BUY)
+      {
+         // Base break-even: entry price + buffer
+         double targetSL = openPrice + beBuffer;
+
+         // For a BUY trade, use confirmed swing lows on closed candles
+         if(copied >= 5)
          {
-            double newSL = NormalizeDouble(openPrice - point, digits);
-            g_trade.PositionModify(ticket, newSL, tp);
-            LogInfo(StringFormat("%s Sell position %d moved to break-even", st.symbol, ticket));
+            double bestSwingLow = 0;
+            for(int k = 1; k < copied - 1; k++)
+            {
+               // Confirmed swing low on closed bar k
+               if(beRates[k].low < beRates[k - 1].low && beRates[k].low < beRates[k + 1].low)
+               {
+                  if(beRates[k].low > openPrice)
+                  {
+                     bestSwingLow = beRates[k].low;
+                     break; // Most recent confirmed swing low
+                  }
+               }
+            }
+
+            if(bestSwingLow > 0)
+            {
+               double structSL = bestSwingLow - beBuffer;
+               if(structSL > targetSL)
+                  targetSL = structSL;
+            }
+         }
+
+         targetSL = NormalizeDouble(targetSL, digits);
+
+         // Move SL up only, ensuring at least break-even
+         if(targetSL > currentSL && targetSL >= openPrice)
+         {
+            if(g_trade.PositionModify(ticket, targetSL, tp))
+            {
+               LogInfo(StringFormat("%s [BE PROTECT] Buy pos %d SL moved to %.5f (entry=%.5f, profit=$%.2f)",
+                                    st.symbol, ticket, targetSL, openPrice, profit));
+            }
+         }
+      }
+      else if(posType == POSITION_TYPE_SELL)
+      {
+         // Base break-even: entry price - buffer
+         double targetSL = openPrice - beBuffer;
+
+         // For a SELL trade, use confirmed swing highs on closed candles
+         if(copied >= 5)
+         {
+            double bestSwingHigh = 0;
+            for(int k = 1; k < copied - 1; k++)
+            {
+               // Confirmed swing high on closed bar k
+               if(beRates[k].high > beRates[k - 1].high && beRates[k].high > beRates[k + 1].high)
+               {
+                  if(beRates[k].high < openPrice)
+                  {
+                     bestSwingHigh = beRates[k].high;
+                     break; // Most recent confirmed swing high
+                  }
+               }
+            }
+
+            if(bestSwingHigh > 0)
+            {
+               double structSL = bestSwingHigh + beBuffer;
+               if(structSL < targetSL)
+                  targetSL = structSL;
+            }
+         }
+
+         targetSL = NormalizeDouble(targetSL, digits);
+
+         // Move SL down only, ensuring at least break-even
+         if((currentSL == 0 || targetSL < currentSL) && targetSL <= openPrice)
+         {
+            if(g_trade.PositionModify(ticket, targetSL, tp))
+            {
+               LogInfo(StringFormat("%s [BE PROTECT] Sell pos %d SL moved to %.5f (entry=%.5f, profit=$%.2f)",
+                                    st.symbol, ticket, targetSL, openPrice, profit));
+            }
          }
       }
    }
@@ -3086,6 +3320,8 @@ void ResetSetup(SSymbolState &st)
    st.setupStartTime   = 0;
    st.partialCloseDone = false;
    st.targetLiqLevel   = 0;
+   st.beActivated      = false;
+   st.beHighestProfit  = 0;
    // NOTE: We deliberately do NOT reset pdhConsumed, pdlConsumed, lastFailedSweepTime, lastFailedSweepPrice!
    // Those persist across reset so that Rule 7 (No immediate re-entry after SL) is strictly enforced.
 }
@@ -3219,21 +3455,22 @@ void ProcessSymbol(int si)
          }
 
          //───────────────────────────────────────────────────
-         // STEP 4: 15M Displacement & POI (OB / FVG) Creation
+         // STEP 4: Structure Displacement & POI (OB / FVG) Creation (Rule 1)
          //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_CHOCH:
          {
             int age = BarsElapsed(sym, Setup_Timeframe, g_states[si].setupStartTime);
             if(age > SetupExpirationBars)
             {
-               LogInfo(StringFormat("%s Setup expired while waiting for 15M displacement (age=%d bars)", sym, age));
+               LogInfo(StringFormat("%s Setup expired while waiting for %s displacement (age=%d bars)",
+                                    sym, EnumToString(Structure_Timeframe), age));
                g_states[si].currentState = STATE_SETUP_INVALIDATED;
                stateChanged = true;
                break;
             }
 
-            // Detect strong 15M displacement opposite to sweep, creating OB / FVG / CHoCH
-            if(Detect15MDisplacementAndPOI(g_states[si], htfRates, htfCount, point))
+            // Detect strong displacement opposite to sweep, creating OB / FVG / CHoCH on Structure_Timeframe (5M)
+            if(DetectStructureDisplacementAndPOI(g_states[si], Structure_Timeframe, point))
             {
                DrawCHoCHLine(g_states[si]);
                if(g_states[si].obValid)  DrawOrderBlock(g_states[si]);
@@ -3348,17 +3585,20 @@ void ProcessSymbol(int si)
                                     sym, EnumToString(Entry_Timeframe), EnumToString(EntryMode)));
                DrawEntryLevels(g_states[si]);
 
+               bool entered = false;
                if(EntryMode == ENTRY_PENDING)
                {
                   if(PlacePendingOrders(g_states[si], point))
                   {
                      g_states[si].currentState = STATE_ORDERS_PLACED;
                      stateChanged = true;
+                     entered = true;
                   }
                   else if(ExecuteMarketEntry(g_states[si], point))
                   {
                      g_states[si].currentState = STATE_POSITION_ACTIVE;
                      stateChanged = true;
+                     entered = true;
                   }
                   else
                   {
@@ -3372,6 +3612,7 @@ void ProcessSymbol(int si)
                   {
                      g_states[si].currentState = STATE_POSITION_ACTIVE;
                      stateChanged = true;
+                     entered = true;
                   }
                   else
                   {
@@ -3385,12 +3626,24 @@ void ProcessSymbol(int si)
                   {
                      g_states[si].currentState = STATE_POSITION_ACTIVE;
                      stateChanged = true;
+                     entered = true;
                   }
                   else
                   {
                      g_states[si].currentState = STATE_SETUP_INVALIDATED;
                      stateChanged = true;
                   }
+               }
+
+               if(entered)
+               {
+                  // Rules 2 & 5: Lock setup immediately upon entry. Mark as consumed so no second entry or re-entry can occur!
+                  if(g_states[si].isPDHSweep) g_states[si].pdhConsumed = true;
+                  if(g_states[si].isPDLSweep) g_states[si].pdlConsumed = true;
+                  g_states[si].lastFailedSweepTime  = g_states[si].sweepTime;
+                  g_states[si].lastFailedSweepPrice = g_states[si].sweepPrice;
+                  g_states[si].lastFailedBias       = g_states[si].bias;
+                  LogInfo(StringFormat("%s [SETUP LOCKED] Entry executed. Sweep setup marked consumed. Re-entry strictly locked.", sym));
                }
             }
             break;
@@ -3469,29 +3722,28 @@ void ProcessSymbol(int si)
 
                if(dealsFound > 0 && setupProfit < 0)
                {
-                  // STOP LOSS / LOSS HIT — Rule 7: Invalidate setup & block re-entry
-                  if(BlockReEntryAfterSL)
-                  {
-                     g_states[si].lastFailedSweepTime  = g_states[si].sweepTime;
-                     g_states[si].lastFailedSweepPrice = g_states[si].sweepPrice;
-                     g_states[si].lastFailedBias       = g_states[si].bias;
-                     if(g_states[si].isPDHSweep) g_states[si].pdhConsumed = true;
-                     if(g_states[si].isPDLSweep) g_states[si].pdlConsumed = true;
+                  // STOP LOSS / LOSS HIT — Rule 2: Invalidate setup & strictly block re-entry
+                  g_states[si].lastFailedSweepTime  = g_states[si].sweepTime;
+                  g_states[si].lastFailedSweepPrice = g_states[si].sweepPrice;
+                  g_states[si].lastFailedBias       = g_states[si].bias;
+                  if(g_states[si].isPDHSweep) g_states[si].pdhConsumed = true;
+                  if(g_states[si].isPDLSweep) g_states[si].pdlConsumed = true;
 
-                     LogWarn(StringFormat("%s [SL HIT - RULE 7] Trade closed with LOSS (%.2f). Setup marked CONSUMED. Immediate re-entry blocked. Waiting for completely new sweep.",
-                                          sym, setupProfit));
-                  }
-                  else
-                  {
-                     LogInfo(StringFormat("%s Trade closed with loss (%.2f)", sym, setupProfit));
-                  }
+                  LogWarn(StringFormat("%s [SL HIT - STRICT NO RE-ENTRY (RULE 2)] Trade closed with LOSS (%.2f). Setup marked CONSUMED. Immediate re-entry blocked. Waiting for completely new sweep.",
+                                       sym, setupProfit));
                   g_states[si].currentState = STATE_SETUP_INVALIDATED;
                   stateChanged = true;
                }
                else
                {
-                  // TARGET REACHED / PROFIT
-                  LogInfo(StringFormat("%s [TARGET REACHED] Trade closed in PROFIT (%.2f). Setup completed successfully.",
+                  // TARGET REACHED / PROFIT — Rule 2: Setup marked CONSUMED, no re-entry from same sweep
+                  g_states[si].lastFailedSweepTime  = g_states[si].sweepTime;
+                  g_states[si].lastFailedSweepPrice = g_states[si].sweepPrice;
+                  g_states[si].lastFailedBias       = g_states[si].bias;
+                  if(g_states[si].isPDHSweep) g_states[si].pdhConsumed = true;
+                  if(g_states[si].isPDLSweep) g_states[si].pdlConsumed = true;
+
+                  LogInfo(StringFormat("%s [TARGET REACHED - STRICT NO RE-ENTRY (RULE 2)] Trade closed in PROFIT (%.2f). Setup marked CONSUMED. Waiting for brand new sweep.",
                                        sym, setupProfit));
                   g_states[si].currentState = STATE_TARGET_REACHED;
                   stateChanged = true;
